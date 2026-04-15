@@ -1,0 +1,37 @@
+# Build outputs and release artifacts
+bin/
+dist/
+release/
+artifacts/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Generated WASM modules
+*.wasm
+!internal/generator/vmtemplate.wasm
+
+# Logs, coverage, and temporary files
+*.log
+*.tmp
+*.temp
+coverage.out
+*.prof
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local reference and scratch material not intended for GitHub
+reference/
+masm2wasm.wasm

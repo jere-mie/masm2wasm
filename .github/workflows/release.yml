@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version without the leading v
+        required: true
+        default: 0.1.0
+      prerelease:
+        description: Mark the release as a prerelease
+        required: true
+        type: boolean
+        default: false
+      draft:
+        description: Create the release as a draft
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      build_date: ${{ steps.meta.outputs.build_date }}
+    steps:
+      - id: meta
+        shell: bash
+        run: |
+          version='${{ github.event.inputs.version }}'
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "Version must be valid semantic versioning (for example: 0.1.0 or 0.2.0-rc.1)." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build release binary
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_DATE: ${{ needs.validate.outputs.build_date }}
+        run: |
+          mkdir -p dist
+          artifact="masm2wasm_${RELEASE_VERSION}_${GOOS}_${GOARCH}${{ matrix.ext }}"
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X masminterpreter/internal/version.Version=${RELEASE_VERSION} -X masminterpreter/internal/version.Commit=${RELEASE_COMMIT} -X masminterpreter/internal/version.BuildDate=${RELEASE_DATE}" \
+            -o "dist/${artifact}" \
+            ./cmd/masm2wasm
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: masm2wasm-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: masm2wasm-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_PRERELEASE: ${{ github.event.inputs.prerelease }}
+          RELEASE_DRAFT: ${{ github.event.inputs.draft }}
+        run: |
+          args=(
+            release create "$RELEASE_TAG"
+            --title "$RELEASE_TAG"
+            --generate-notes
+          )
+          if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          if [[ "$RELEASE_DRAFT" == "true" ]]; then
+            args+=(--draft)
+          fi
+          for file in dist/*; do
+            args+=("$file")
+          done
+          gh "${args[@]}"
