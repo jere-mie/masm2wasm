@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/text/encoding/charmap"
 )
 
 const (
@@ -30,6 +32,7 @@ const (
 	stdInputHandleValue  = uint32(0xFFFFFFF6)
 	stdOutputHandleValue = uint32(0xFFFFFFF5)
 	stdErrorHandleValue  = uint32(0xFFFFFFF4)
+	processHeapHandle    = uint32(1)
 )
 
 type Machine struct {
@@ -39,11 +42,12 @@ type Machine struct {
 	stderr        io.Writer
 	peekableInput bool
 
-	program *Program
-	memory  []byte
-	symbols map[string]Symbol
-	procs   map[string]*Procedure
-	regs    [8]uint32
+	program   *Program
+	memory    []byte
+	symbols   map[string]Symbol
+	procs     map[string]*Procedure
+	procAddrs map[uint32]*Procedure
+	regs      [8]uint32
 
 	zf bool
 	sf bool
@@ -53,12 +57,14 @@ type Machine struct {
 	pf bool
 	df bool
 
-	exitCode int
-	args     []string
+	exitCode   int
+	args       []string
+	terminated bool
 
-	rng       *rand.Rand
-	startTime time.Time
-	lastError string
+	rng           *rand.Rand
+	startTime     time.Time
+	lastError     string
+	lastErrorCode uint32
 
 	colorAttr uint32
 	cursorX   int
@@ -74,15 +80,55 @@ type Machine struct {
 	consoleTitle      string
 	cursorVisible     bool
 	cursorSize        uint32
+	inputCodePage     uint32
+	outputCodePage    uint32
 	screenWidth       int
 	screenHeight      int
 	inputConsoleMode  uint32
 	outputConsoleMode uint32
+	windowLeft        int
+	windowTop         int
+	windowRight       int
+	windowBottom      int
+	consoleCells      map[uint64]consoleCell
+	heapTop           uint32
+	nextHeapHandle    uint32
+	heapHandles       map[uint32]bool
+	heapAllocs        map[uint32]heapBlock
 }
 
 type frame struct {
 	proc *Procedure
 	pc   int
+}
+
+type heapBlock struct {
+	handle uint32
+	size   uint32
+}
+
+type consoleCell struct {
+	ch      byte
+	hasChar bool
+	attr    uint16
+	hasAttr bool
+}
+
+type cArgReader struct {
+	machine     *Machine
+	operands    []Operand
+	stackBase   uint32
+	stackOffset uint32
+	fromStack   bool
+	index       int
+}
+
+type cFormatSpec struct {
+	Flags     string
+	Width     string
+	Precision int
+	Length    string
+	Verb      byte
 }
 
 func NewMachine(stdin io.Reader, stdout io.Writer, stderr io.Writer) *Machine {
@@ -115,15 +161,21 @@ func (m *Machine) Run(program *Program) (int, error) {
 		m.symbols[strings.ToLower(symbol.Name)] = symbol
 	}
 	m.procs = make(map[string]*Procedure, len(program.Procedures))
+	m.procAddrs = make(map[uint32]*Procedure, len(program.Procedures))
 	for i := range program.Procedures {
 		proc := &program.Procedures[i]
 		m.procs[strings.ToLower(proc.Name)] = proc
+		if proc.Address != 0 {
+			m.procAddrs[proc.Address] = proc
+		}
 	}
 	m.regs = [8]uint32{}
 	m.regs[regESP] = uint32(len(m.memory))
 	m.zf, m.sf, m.cf, m.of, m.af, m.pf, m.df = false, false, false, false, false, false, false
 	m.exitCode = 0
+	m.terminated = false
 	m.lastError = ""
+	m.lastErrorCode = 0
 	m.startTime = time.Now()
 	m.colorAttr = 0x07
 	m.cursorX, m.cursorY = 0, 0
@@ -135,10 +187,21 @@ func (m *Machine) Run(program *Program) (int, error) {
 	m.consoleTitle = ""
 	m.cursorVisible = true
 	m.cursorSize = 25
+	m.inputCodePage = 437
+	m.outputCodePage = 437
 	m.screenWidth = 80
 	m.screenHeight = 25
 	m.inputConsoleMode = 0
 	m.outputConsoleMode = 0
+	m.windowLeft = 0
+	m.windowTop = 0
+	m.windowRight = 79
+	m.windowBottom = 24
+	m.consoleCells = map[uint64]consoleCell{}
+	m.heapTop = alignUp32(uint32(len(program.Data)), 4)
+	m.nextHeapHandle = 2
+	m.heapHandles = map[uint32]bool{processHeapHandle: true}
+	m.heapAllocs = map[uint32]heapBlock{}
 
 	entry := strings.ToLower(program.Entry)
 	if entry == "" {
@@ -165,6 +228,10 @@ func (m *Machine) Run(program *Program) (int, error) {
 		if err != nil {
 			return 1, fmt.Errorf("%s:%d: %w", current.proc.Name, inst.Line, err)
 		}
+		if m.terminated {
+			frames = frames[:0]
+			break
+		}
 		if jumped {
 			continue
 		}
@@ -185,6 +252,10 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 		return false, m.execAddSub(inst, false)
 	case "sub":
 		return false, m.execAddSub(inst, true)
+	case "adc":
+		return false, m.execAdcSbb(inst, false)
+	case "sbb":
+		return false, m.execAdcSbb(inst, true)
 	case "xor":
 		return false, m.execLogic(inst, "xor")
 	case "and":
@@ -217,6 +288,12 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 		return false, m.execShift(inst, "shr")
 	case "sar":
 		return false, m.execShift(inst, "sar")
+	case "shld", "shrd":
+		return false, m.execDoubleShift(inst, strings.ToLower(inst.Op))
+	case "rol", "ror", "rcl", "rcr":
+		return false, m.execRotate(inst, strings.ToLower(inst.Op))
+	case "aaa", "aas", "daa", "das":
+		return false, m.execDecimalAdjust(strings.ToLower(inst.Op))
 	case "movzx":
 		return false, m.execMovX(inst, false)
 	case "movsx":
@@ -227,14 +304,30 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 		return false, m.execPop(inst)
 	case "pushad":
 		return false, m.execPushad()
+	case "pusha":
+		return false, m.execPushad()
 	case "popad":
+		return false, m.execPopad()
+	case "popa":
 		return false, m.execPopad()
 	case "pushfd":
 		return false, m.execPushfd()
+	case "pushf":
+		return false, m.execPushfd()
 	case "popfd":
+		return false, m.execPopfd()
+	case "popf":
 		return false, m.execPopfd()
 	case "leave":
 		return false, m.execLeave()
+	case "enter":
+		return false, m.execEnter(inst)
+	case "cbw":
+		return false, m.execCBW()
+	case "cwd":
+		return false, m.execCWD()
+	case "cwde":
+		return false, m.execCWDE()
 	case "finit":
 		return false, m.execFInit()
 	case "fld":
@@ -245,6 +338,18 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 		return false, m.execFLDZ()
 	case "fild":
 		return false, m.execFILD(inst)
+	case "fiadd":
+		return false, m.execFIArithmetic(inst, "add")
+	case "fisub":
+		return false, m.execFIArithmetic(inst, "sub")
+	case "fisubr":
+		return false, m.execFIArithmetic(inst, "subr")
+	case "fimul":
+		return false, m.execFIArithmetic(inst, "mul")
+	case "fidiv":
+		return false, m.execFIArithmetic(inst, "div")
+	case "fidivr":
+		return false, m.execFIArithmetic(inst, "divr")
 	case "fst":
 		return false, m.execFST(inst, false)
 	case "fstp":
@@ -252,7 +357,9 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 	case "fstsw":
 		return false, m.execFNSTSW(inst)
 	case "fist":
-		return false, m.execFIST(inst)
+		return false, m.execFIST(inst, false)
+	case "fistp":
+		return false, m.execFIST(inst, true)
 	case "fadd":
 		return false, m.execFArithmetic(inst, "add")
 	case "fsub":
@@ -271,10 +378,16 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 		return false, m.execFUnary("abs")
 	case "fsqrt":
 		return false, m.execFUnary("sqrt")
+	case "f2xm1":
+		return false, m.execF2XM1()
+	case "fyl2x":
+		return false, m.execFYL2X()
 	case "frndint":
 		return false, m.execFRNDINT()
 	case "ftst":
 		return false, m.execFTST()
+	case "fcom":
+		return false, m.execFCOM(inst)
 	case "fcomi":
 		return false, m.execFCOMI(inst)
 	case "fcomp":
@@ -299,6 +412,15 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 		return false, nil
 	case "std":
 		m.df = true
+		return false, nil
+	case "clc":
+		m.cf = false
+		return false, nil
+	case "stc":
+		m.cf = true
+		return false, nil
+	case "cmc":
+		m.cf = !m.cf
 		return false, nil
 	case "lodsb":
 		return false, m.execLods(1)
@@ -374,6 +496,8 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 		return false, m.execRepeatString("repne", "scasd")
 	case "xchg":
 		return false, m.execXchg(inst)
+	case "xlat":
+		return false, m.execXLAT(inst)
 	case "cdq":
 		return false, m.execCDQ()
 	case "nop":
@@ -413,6 +537,12 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 	case "loop":
 		m.regs[regECX]--
 		return m.jumpIf(current, inst, m.regs[regECX] != 0)
+	case "loopz", "loope":
+		m.regs[regECX]--
+		return m.jumpIf(current, inst, m.regs[regECX] != 0 && m.zf)
+	case "loopnz", "loopne":
+		m.regs[regECX]--
+		return m.jumpIf(current, inst, m.regs[regECX] != 0 && !m.zf)
 	case "call":
 		return false, m.execCall(frames, inst)
 	case "invoke":
@@ -490,6 +620,55 @@ func (m *Machine) execAddSub(inst Instruction, subtract bool) error {
 	} else {
 		result = left + right
 		m.updateAddFlags(left, right, result, width)
+	}
+	return m.assign(inst.Args[0], result, width)
+}
+
+func (m *Machine) execAdcSbb(inst Instruction, subtract bool) error {
+	if len(inst.Args) != 2 {
+		return fmt.Errorf("%s expects two operands", inst.Op)
+	}
+	width, err := m.operandWidth(inst.Args[0], inst.Args[1], 4)
+	if err != nil {
+		return err
+	}
+	left, _, err := m.resolveValue(inst.Args[0], width)
+	if err != nil {
+		return err
+	}
+	right, _, err := m.resolveValue(inst.Args[1], width)
+	if err != nil {
+		return err
+	}
+	carryIn := uint32(0)
+	if m.cf {
+		carryIn = 1
+	}
+	mask := widthMask(width)
+	left &= mask
+	right &= mask
+	var result uint32
+	if subtract {
+		subtrahend64 := uint64(right) + uint64(carryIn)
+		subtrahend := uint32(subtrahend64) & mask
+		result = truncate(left-subtrahend, width)
+		m.zf = result == 0
+		m.sf = signBit(result, width)
+		m.cf = uint64(left) < subtrahend64
+		m.of = (((left ^ subtrahend) & (left ^ result)) & signMask(width)) != 0
+		m.af = ((left ^ subtrahend ^ result) & 0x10) != 0
+		m.pf = parity8(byte(result))
+	} else {
+		addend64 := uint64(right) + uint64(carryIn)
+		addend := uint32(addend64) & mask
+		sum := uint64(left) + addend64
+		result = uint32(sum) & mask
+		m.zf = result == 0
+		m.sf = signBit(result, width)
+		m.cf = sum > uint64(mask)
+		m.of = ((^(left ^ addend)) & (left ^ result) & signMask(width)) != 0
+		m.af = ((left ^ addend ^ result) & 0x10) != 0
+		m.pf = parity8(byte(result))
 	}
 	return m.assign(inst.Args[0], result, width)
 }
@@ -610,19 +789,49 @@ func (m *Machine) execMul(inst Instruction, signed bool) error {
 		return err
 	}
 	if signed {
-		product := int64(signExtend(left, width)) * int64(signExtend(right, width))
-		m.regs[regEAX] = uint32(product)
-		m.regs[regEDX] = uint32(uint64(product) >> 32)
+		switch width {
+		case 1:
+			product := int16(int8(left)) * int16(int8(right))
+			m.writeRegister("ax", uint32(uint16(product)))
+			m.cf = product < -128 || product > 127
+			m.of = m.cf
+		case 2:
+			product := int32(int16(left)) * int32(int16(right))
+			m.writeRegister("ax", uint32(uint16(product)))
+			m.writeRegister("dx", uint32(uint16(product>>16)))
+			m.cf = product < -32768 || product > 32767
+			m.of = m.cf
+		default:
+			product := int64(signExtend(left, width)) * int64(signExtend(right, width))
+			m.regs[regEAX] = uint32(product)
+			m.regs[regEDX] = uint32(uint64(product) >> 32)
+			m.cf = int64(signExtend(m.regs[regEAX], 4)) != product
+			m.of = m.cf
+		}
 	} else {
-		product := uint64(left) * uint64(right)
-		m.regs[regEAX] = uint32(product)
-		m.regs[regEDX] = uint32(product >> 32)
+		switch width {
+		case 1:
+			product := uint16(uint8(left)) * uint16(uint8(right))
+			m.writeRegister("ax", uint32(product))
+			m.cf = product > 0xFF
+			m.of = m.cf
+		case 2:
+			product := uint32(uint16(left)) * uint32(uint16(right))
+			m.writeRegister("ax", product)
+			m.writeRegister("dx", product>>16)
+			m.cf = product > 0xFFFF
+			m.of = m.cf
+		default:
+			product := uint64(left) * uint64(right)
+			m.regs[regEAX] = uint32(product)
+			m.regs[regEDX] = uint32(product >> 32)
+			m.cf = m.regs[regEDX] != 0
+			m.of = m.cf
+		}
 	}
-	m.cf = m.regs[regEDX] != 0
-	m.of = m.cf
-	m.zf = m.regs[regEAX] == 0 && m.regs[regEDX] == 0
-	m.sf = signBit(m.regs[regEAX], 4)
-	m.pf = parity8(byte(m.regs[regEAX]))
+	m.zf = m.readAccumulator(width) == 0
+	m.sf = signBit(m.readAccumulator(width), width)
+	m.pf = parity8(byte(m.readAccumulator(width)))
 	m.af = false
 	return nil
 }
@@ -680,24 +889,48 @@ func (m *Machine) execDiv(inst Instruction, signed bool) error {
 		return fmt.Errorf("division by zero")
 	}
 	if signed {
-		dividend := int64(int32(m.regs[regEAX]))
-		if width == 2 {
-			dividend = int64(int16(m.readRegister("ax")))
+		switch width {
+		case 1:
+			dividend := int16(m.readRegister("ax"))
+			div := int16(int8(divisor))
+			quotient := dividend / div
+			remainder := dividend % div
+			m.writeRegister("al", uint32(uint8(quotient)))
+			m.writeRegister("ah", uint32(uint8(remainder)))
+		case 2:
+			dividend := int32(uint32(m.readRegister("ax")) | (uint32(m.readRegister("dx")) << 16))
+			dividend = int32(dividend)
+			div := int32(int16(divisor))
+			quotient := dividend / div
+			remainder := dividend % div
+			m.writeRegister("ax", uint32(uint16(quotient)))
+			m.writeRegister("dx", uint32(uint16(remainder)))
+		default:
+			dividend := int64(int32(m.regs[regEDX]))<<32 | int64(uint32(m.regs[regEAX]))
+			quotient := dividend / int64(int32(divisor))
+			remainder := dividend % int64(int32(divisor))
+			m.regs[regEAX] = uint32(quotient)
+			m.regs[regEDX] = uint32(remainder)
 		}
-		if width == 4 {
-			dividend = int64(int32(m.regs[regEDX]))<<32 | int64(uint32(m.regs[regEAX]))
-		}
-		quotient := dividend / int64(int32(divisor))
-		remainder := dividend % int64(int32(divisor))
-		m.regs[regEAX] = uint32(quotient)
-		m.regs[regEDX] = uint32(remainder)
 	} else {
-		dividend := uint64(m.regs[regEAX])
-		if width == 4 {
-			dividend = uint64(m.regs[regEDX])<<32 | uint64(m.regs[regEAX])
+		switch width {
+		case 1:
+			dividend := uint16(m.readRegister("ax"))
+			quotient := dividend / uint16(uint8(divisor))
+			remainder := dividend % uint16(uint8(divisor))
+			m.writeRegister("al", uint32(uint8(quotient)))
+			m.writeRegister("ah", uint32(uint8(remainder)))
+		case 2:
+			dividend := uint32(m.readRegister("ax")) | (uint32(m.readRegister("dx")) << 16)
+			quotient := dividend / uint32(uint16(divisor))
+			remainder := dividend % uint32(uint16(divisor))
+			m.writeRegister("ax", quotient)
+			m.writeRegister("dx", remainder)
+		default:
+			dividend := uint64(m.regs[regEDX])<<32 | uint64(m.regs[regEAX])
+			m.regs[regEAX] = uint32(dividend / uint64(divisor))
+			m.regs[regEDX] = uint32(dividend % uint64(divisor))
 		}
-		m.regs[regEAX] = uint32(dividend / uint64(divisor))
-		m.regs[regEDX] = uint32(dividend % uint64(divisor))
 	}
 	return nil
 }
@@ -781,6 +1014,195 @@ func (m *Machine) execShift(inst Instruction, op string) error {
 	return m.assign(inst.Args[0], result, width)
 }
 
+func (m *Machine) execDoubleShift(inst Instruction, op string) error {
+	if len(inst.Args) != 3 {
+		return fmt.Errorf("%s expects three operands", op)
+	}
+	width, err := m.operandWidth(inst.Args[0], Operand{}, 4)
+	if err != nil {
+		return err
+	}
+	if width != 2 && width != 4 {
+		return fmt.Errorf("%s requires a word or dword destination", op)
+	}
+	dest, _, err := m.resolveValue(inst.Args[0], width)
+	if err != nil {
+		return err
+	}
+	src, _, err := m.resolveValue(inst.Args[1], width)
+	if err != nil {
+		return err
+	}
+	count, _, err := m.resolveValue(inst.Args[2], 1)
+	if err != nil {
+		return err
+	}
+	count &= 0x1F
+	if count == 0 {
+		return nil
+	}
+	bits := uint(width * 8)
+	if count > uint32(bits) {
+		count = uint32(bits)
+	}
+
+	originalDest := truncate(dest, width)
+	originalSign := signBit(originalDest, width)
+	var result uint32
+	switch op {
+	case "shld":
+		m.cf = ((originalDest >> (bits - uint(count))) & 1) != 0
+		combined := (uint64(originalDest) << bits) | uint64(truncate(src, width))
+		result = uint32((combined << uint(count)) >> bits)
+	case "shrd":
+		m.cf = ((originalDest >> (uint(count) - 1)) & 1) != 0
+		combined := uint64(originalDest) | (uint64(truncate(src, width)) << bits)
+		result = uint32(combined >> uint(count))
+	default:
+		return fmt.Errorf("unsupported double shift %q", op)
+	}
+
+	result = truncate(result, width)
+	m.assignLogicFlags(result, width)
+	if count == 1 {
+		m.of = originalSign != signBit(result, width)
+	}
+	return m.assign(inst.Args[0], result, width)
+}
+
+func (m *Machine) execRotate(inst Instruction, op string) error {
+	if len(inst.Args) != 2 {
+		return fmt.Errorf("%s expects two operands", op)
+	}
+	width, err := m.operandWidth(inst.Args[0], Operand{}, 4)
+	if err != nil {
+		return err
+	}
+	value, _, err := m.resolveValue(inst.Args[0], width)
+	if err != nil {
+		return err
+	}
+	count, _, err := m.resolveValue(inst.Args[1], 1)
+	if err != nil {
+		return err
+	}
+	withCarry := op == "rcl" || op == "rcr"
+	count = effectiveRotateCount(count, width, withCarry)
+	if count == 0 {
+		return nil
+	}
+	result := truncate(value, width)
+	for range count {
+		switch op {
+		case "rol":
+			carryOut := (result & signMask(width)) != 0
+			result = truncate((result<<1)|uint32(boolToInt(carryOut)), width)
+			m.cf = carryOut
+		case "ror":
+			carryOut := (result & 1) != 0
+			result >>= 1
+			if carryOut {
+				result |= signMask(width)
+			}
+			result = truncate(result, width)
+			m.cf = carryOut
+		case "rcl":
+			carryOut := (result & signMask(width)) != 0
+			result = truncate((result<<1)|uint32(boolToInt(m.cf)), width)
+			m.cf = carryOut
+		case "rcr":
+			carryOut := (result & 1) != 0
+			result >>= 1
+			if m.cf {
+				result |= signMask(width)
+			}
+			result = truncate(result, width)
+			m.cf = carryOut
+		}
+	}
+	if count == 1 {
+		switch op {
+		case "rol", "rcl":
+			m.of = signBit(result, width) != m.cf
+		case "ror", "rcr":
+			m.of = signBit(result, width) != nextSignBit(result, width)
+		}
+	}
+	return m.assign(inst.Args[0], result, width)
+}
+
+func (m *Machine) execDecimalAdjust(op string) error {
+	al := byte(m.readRegister("al"))
+	ah := byte(m.readRegister("ah"))
+	switch op {
+	case "aaa":
+		if (al&0x0F) > 9 || m.af {
+			al += 0x06
+			ah++
+			m.af = true
+			m.cf = true
+		} else {
+			m.af = false
+			m.cf = false
+		}
+		al &= 0x0F
+		m.writeRegister("al", uint32(al))
+		m.writeRegister("ah", uint32(ah))
+		return nil
+	case "aas":
+		if (al&0x0F) > 9 || m.af {
+			al -= 0x06
+			ah--
+			m.af = true
+			m.cf = true
+		} else {
+			m.af = false
+			m.cf = false
+		}
+		al &= 0x0F
+		m.writeRegister("al", uint32(al))
+		m.writeRegister("ah", uint32(ah))
+		return nil
+	case "daa":
+		oldAL := al
+		oldCF := m.cf
+		if (al&0x0F) > 9 || m.af {
+			al += 0x06
+			m.af = true
+		} else {
+			m.af = false
+		}
+		if oldAL > 0x99 || oldCF {
+			al += 0x60
+			m.cf = true
+		} else {
+			m.cf = false
+		}
+	case "das":
+		oldAL := al
+		oldCF := m.cf
+		if (al&0x0F) > 9 || m.af {
+			al -= 0x06
+			m.af = true
+		} else {
+			m.af = false
+		}
+		if oldAL > 0x99 || oldCF {
+			al -= 0x60
+			m.cf = true
+		} else {
+			m.cf = false
+		}
+	default:
+		return fmt.Errorf("unsupported decimal adjust %q", op)
+	}
+	m.writeRegister("al", uint32(al))
+	m.zf = al == 0
+	m.sf = al&0x80 != 0
+	m.pf = parity8(al)
+	return nil
+}
+
 func (m *Machine) execMovX(inst Instruction, sign bool) error {
 	if len(inst.Args) != 2 {
 		return fmt.Errorf("%s expects two operands", inst.Op)
@@ -800,6 +1222,46 @@ func (m *Machine) execMovX(inst Instruction, sign bool) error {
 		value = uint32(signExtend(value, srcWidth))
 	}
 	return m.assign(inst.Args[0], value, registerWidth(inst.Args[0].Text))
+}
+
+func (m *Machine) execEnter(inst Instruction) error {
+	if len(inst.Args) != 2 {
+		return fmt.Errorf("enter expects two operands")
+	}
+	allocSize, _, err := m.resolveValue(inst.Args[0], 2)
+	if err != nil {
+		return err
+	}
+	level, _, err := m.resolveValue(inst.Args[1], 1)
+	if err != nil {
+		return err
+	}
+	level &= 0x1F
+
+	oldEBP := m.regs[regEBP]
+	if err := m.push32(oldEBP); err != nil {
+		return err
+	}
+	frameTemp := m.regs[regESP]
+	if level > 0 {
+		copyEBP := oldEBP
+		for i := uint32(1); i < level; i++ {
+			copyEBP -= 4
+			value, err := m.readMemory(copyEBP, 4)
+			if err != nil {
+				return err
+			}
+			if err := m.push32(value); err != nil {
+				return err
+			}
+		}
+		if err := m.push32(frameTemp); err != nil {
+			return err
+		}
+	}
+	m.regs[regEBP] = frameTemp
+	m.regs[regESP] -= allocSize
+	return nil
 }
 
 func (m *Machine) execPush(inst Instruction) error {
@@ -885,6 +1347,25 @@ func (m *Machine) execLeave() error {
 	return nil
 }
 
+func (m *Machine) execCBW() error {
+	m.writeRegister("ax", uint32(uint16(int16(int8(m.readRegister("al"))))))
+	return nil
+}
+
+func (m *Machine) execCWD() error {
+	if int16(m.readRegister("ax")) < 0 {
+		m.writeRegister("dx", 0xFFFF)
+	} else {
+		m.writeRegister("dx", 0)
+	}
+	return nil
+}
+
+func (m *Machine) execCWDE() error {
+	m.writeRegister("eax", uint32(int32(int16(m.readRegister("ax")))))
+	return nil
+}
+
 func (m *Machine) execFInit() error {
 	m.fpu = nil
 	m.fpuControlWord = 0x037F
@@ -922,6 +1403,37 @@ func (m *Machine) execFILD(inst Instruction) error {
 	return m.fpuPush(float64(value))
 }
 
+func (m *Machine) execFIArithmetic(inst Instruction, op string) error {
+	if len(inst.Args) != 1 {
+		return fmt.Errorf("%s expects one operand", inst.Op)
+	}
+	left, err := m.fpuPeek(0)
+	if err != nil {
+		return err
+	}
+	rightInt, err := m.readSignedIntegerOperand(inst.Args[0])
+	if err != nil {
+		return err
+	}
+	right := float64(rightInt)
+	switch op {
+	case "add":
+		return m.fpuSet(0, left+right)
+	case "sub":
+		return m.fpuSet(0, left-right)
+	case "subr":
+		return m.fpuSet(0, right-left)
+	case "mul":
+		return m.fpuSet(0, left*right)
+	case "div":
+		return m.fpuSet(0, left/right)
+	case "divr":
+		return m.fpuSet(0, right/left)
+	default:
+		return fmt.Errorf("unsupported integer floating-point op %q", op)
+	}
+}
+
 func (m *Machine) execFST(inst Instruction, pop bool) error {
 	if len(inst.Args) != 1 {
 		return fmt.Errorf("%s expects one operand", inst.Op)
@@ -940,9 +1452,9 @@ func (m *Machine) execFST(inst Instruction, pop bool) error {
 	return nil
 }
 
-func (m *Machine) execFIST(inst Instruction) error {
+func (m *Machine) execFIST(inst Instruction, pop bool) error {
 	if len(inst.Args) != 1 {
-		return fmt.Errorf("fist expects one operand")
+		return fmt.Errorf("%s expects one operand", inst.Op)
 	}
 	value, err := m.fpuPeek(0)
 	if err != nil {
@@ -955,12 +1467,26 @@ func (m *Machine) execFIST(inst Instruction) error {
 	}
 	switch width {
 	case 2:
-		return m.assign(inst.Args[0], uint32(int16(rounded)), 2)
+		err = m.assign(inst.Args[0], uint32(int16(rounded)), 2)
 	case 4:
-		return m.assign(inst.Args[0], uint32(int32(rounded)), 4)
+		err = m.assign(inst.Args[0], uint32(int32(rounded)), 4)
+	case 8:
+		addr, addrErr := m.requireAddress(inst.Args[0])
+		if addrErr != nil {
+			return addrErr
+		}
+		err = m.writeMemory64(addr, uint64(rounded))
 	default:
-		return fmt.Errorf("unsupported integer width %d for fist", width)
+		return fmt.Errorf("unsupported integer width %d for %s", width, inst.Op)
 	}
+	if err != nil {
+		return err
+	}
+	if pop {
+		_, err = m.fpuPop()
+		return err
+	}
+	return nil
 }
 
 func (m *Machine) execFArithmetic(inst Instruction, op string) error {
@@ -1093,6 +1619,30 @@ func (m *Machine) execFUnary(op string) error {
 	return m.fpuSet(0, value)
 }
 
+func (m *Machine) execF2XM1() error {
+	value, err := m.fpuPeek(0)
+	if err != nil {
+		return err
+	}
+	return m.fpuSet(0, math.Exp2(value)-1)
+}
+
+func (m *Machine) execFYL2X() error {
+	x, err := m.fpuPeek(0)
+	if err != nil {
+		return err
+	}
+	y, err := m.fpuPeek(1)
+	if err != nil {
+		return err
+	}
+	if err := m.fpuSet(1, y*math.Log2(x)); err != nil {
+		return err
+	}
+	_, err = m.fpuPop()
+	return err
+}
+
 func (m *Machine) execFRNDINT() error {
 	value, err := m.fpuPeek(0)
 	if err != nil {
@@ -1108,6 +1658,35 @@ func (m *Machine) execFTST() error {
 	}
 	m.setFPUCompareStatus(value, 0)
 	return nil
+}
+
+func (m *Machine) execFCOM(inst Instruction) error {
+	switch len(inst.Args) {
+	case 0:
+		left, err := m.fpuPeek(0)
+		if err != nil {
+			return err
+		}
+		right, err := m.fpuPeek(1)
+		if err != nil {
+			return err
+		}
+		m.setFPUCompareStatus(left, right)
+		return nil
+	case 1:
+		left, err := m.fpuPeek(0)
+		if err != nil {
+			return err
+		}
+		right, err := m.readFloatOperand(inst.Args[0])
+		if err != nil {
+			return err
+		}
+		m.setFPUCompareStatus(left, right)
+		return nil
+	default:
+		return fmt.Errorf("fcom expects zero or one operand")
+	}
 }
 
 func (m *Machine) execFINCSTP() error {
@@ -1364,6 +1943,19 @@ func (m *Machine) execXchg(inst Instruction) error {
 	return m.assign(inst.Args[1], left, width)
 }
 
+func (m *Machine) execXLAT(inst Instruction) error {
+	if len(inst.Args) != 0 {
+		return fmt.Errorf("xlat expects no operands")
+	}
+	addr := m.regs[regEBX] + (m.regs[regEAX] & 0xFF)
+	value, err := m.readMemory(addr, 1)
+	if err != nil {
+		return err
+	}
+	m.writeRegister("al", value)
+	return nil
+}
+
 func (m *Machine) execCDQ() error {
 	if int32(m.regs[regEAX]) < 0 {
 		m.regs[regEDX] = 0xFFFFFFFF
@@ -1377,21 +1969,53 @@ func (m *Machine) execCall(frames *[]frame, inst Instruction) error {
 	if len(inst.Args) != 1 {
 		return fmt.Errorf("call expects one operand")
 	}
-	target := strings.ToLower(inst.Args[0].Text)
-	if target == "" {
-		return fmt.Errorf("call target missing")
+	if inst.Args[0].Kind == "name" {
+		target := strings.ToLower(inst.Args[0].Text)
+		if target == "" {
+			return fmt.Errorf("call target missing")
+		}
+		if target == "exitprocess" {
+			return m.execExitProcessBuiltin(frames)
+		}
+		if builtin := m.dispatchCallBuiltin(target); builtin != nil {
+			return builtin()
+		}
+		proc := m.procs[target]
+		if proc == nil {
+			return fmt.Errorf("unknown procedure %q", inst.Args[0].Text)
+		}
+		return m.enterProcedure(frames, proc)
 	}
-	if builtin := m.dispatchCallBuiltin(target); builtin != nil {
-		return builtin()
+	target, _, err := m.resolveValue(inst.Args[0], 4)
+	if err != nil {
+		return err
 	}
-	proc := m.procs[target]
+	proc := m.procAddrs[target]
 	if proc == nil {
-		return fmt.Errorf("unknown procedure %q", inst.Args[0].Text)
+		return fmt.Errorf("unknown indirect call target %08X", target)
 	}
+	return m.enterProcedure(frames, proc)
+}
+
+func (m *Machine) enterProcedure(frames *[]frame, proc *Procedure) error {
 	if err := m.push32(0xC0DEF00D); err != nil {
 		return err
 	}
 	*frames = append(*frames, frame{proc: proc, pc: 0})
+	return nil
+}
+
+func (m *Machine) execExitProcessBuiltin(frames *[]frame) error {
+	code := 0
+	if m.regs[regESP] < uint32(len(m.memory)) {
+		value, err := m.readMemory(m.regs[regESP], 4)
+		if err == nil {
+			code = int(int32(value))
+		}
+	}
+	m.exitCode = code
+	m.terminated = true
+	*frames = (*frames)[:0]
 	return nil
 }
 
@@ -1600,6 +2224,8 @@ func (m *Machine) dispatchCallBuiltin(name string) func() error {
 		return m.builtinReadString
 	case "readchar":
 		return m.builtinReadChar
+	case "getchar":
+		return m.builtinReadChar
 	case "readkey":
 		return m.builtinReadKey
 	case "readkeyflush":
@@ -1662,6 +2288,34 @@ func (m *Machine) dispatchCallBuiltin(name string) func() error {
 		return m.builtinWriteToFile
 	case "writewindowsmsg":
 		return m.builtinWriteWindowsMsg
+	case "msgbox":
+		return m.builtinMsgBox
+	case "msgboxask":
+		return m.builtinMsgBoxAsk
+	case "setconsoleoutputcp":
+		return m.builtinSetConsoleOutputCP
+	case "getconsoleoutputcp":
+		return m.builtinGetConsoleOutputCP
+	case "setconsolecp":
+		return m.builtinSetConsoleCP
+	case "getconsolecp":
+		return m.builtinGetConsoleCP
+	case "printf":
+		return m.builtinPrintf
+	case "scanf":
+		return m.builtinScanf
+	case "system":
+		return m.builtinSystem
+	case "fopen":
+		return m.builtinFopen
+	case "fclose":
+		return m.builtinFclose
+	case "messagebox", "messageboxa":
+		return m.builtinMessageBox
+	case "formatmessage", "formatmessagea":
+		return m.builtinFormatMessage
+	case "localfree":
+		return m.builtinLocalFree
 	default:
 		return nil
 	}
@@ -1673,6 +2327,34 @@ func (m *Machine) dispatchInvokeBuiltin(name string) func([]Operand) error {
 		return func(args []Operand) error { return m.builtinGetTickCount() }
 	case "sleep":
 		return m.invokeSleep
+	case "msgbox":
+		return func(args []Operand) error { return m.builtinMsgBox() }
+	case "msgboxask":
+		return func(args []Operand) error { return m.builtinMsgBoxAsk() }
+	case "setconsoleoutputcp":
+		return m.invokeSetConsoleOutputCP
+	case "getconsoleoutputcp":
+		return m.invokeGetConsoleOutputCP
+	case "setconsolecp":
+		return m.invokeSetConsoleCP
+	case "getconsolecp":
+		return m.invokeGetConsoleCP
+	case "printf":
+		return m.invokePrintf
+	case "scanf":
+		return m.invokeScanf
+	case "system":
+		return m.invokeSystem
+	case "fopen":
+		return m.invokeFopen
+	case "fclose":
+		return m.invokeFclose
+	case "messagebox", "messageboxa":
+		return m.invokeMessageBox
+	case "formatmessage", "formatmessagea":
+		return m.invokeFormatMessage
+	case "localfree":
+		return m.invokeLocalFree
 	case "str_length", "strlength":
 		return m.invokeStrLength
 	case "str_copy":
@@ -1691,6 +2373,8 @@ func (m *Machine) dispatchInvokeBuiltin(name string) func([]Operand) error {
 		return m.invokeWriteFile
 	case "closehandle":
 		return m.invokeCloseHandle
+	case "setfilepointer":
+		return m.invokeSetFilePointer
 	case "getstdhandle":
 		return m.invokeGetStdHandle
 	case "getconsolemode":
@@ -1707,12 +2391,22 @@ func (m *Machine) dispatchInvokeBuiltin(name string) func([]Operand) error {
 		return m.invokeGetNumberOfConsoleInputEvents
 	case "getkeystate":
 		return m.invokeGetKeyState
+	case "getlasterror":
+		return m.invokeGetLastError
 	case "writeconsole", "writeconsolea":
 		return m.invokeWriteConsole
+	case "writeconsoleoutputcharacter", "writeconsoleoutputcharactera":
+		return m.invokeWriteConsoleOutputCharacter
+	case "writeconsoleoutputattribute":
+		return m.invokeWriteConsoleOutputAttribute
 	case "readconsole", "readconsolea":
 		return m.invokeReadConsole
+	case "setconsoletextattribute":
+		return m.invokeSetConsoleTextAttribute
 	case "setconsolecursorposition":
 		return m.invokeSetConsoleCursorPosition
+	case "setconsolewindowinfo":
+		return m.invokeSetConsoleWindowInfo
 	case "getconsolecursorinfo":
 		return m.invokeGetConsoleCursorInfo
 	case "setconsolecursorinfo":
@@ -1731,14 +2425,25 @@ func (m *Machine) dispatchInvokeBuiltin(name string) func([]Operand) error {
 		return m.invokeWriteStackFrame
 	case "writestackframename":
 		return m.invokeWriteStackFrameName
+	case "exitprocess":
+		return m.invokeExitProcess
+	case "getprocessheap":
+		return m.invokeGetProcessHeap
+	case "heapalloc":
+		return m.invokeHeapAlloc
+	case "heapfree":
+		return m.invokeHeapFree
+	case "heapcreate":
+		return m.invokeHeapCreate
+	case "heapdestroy":
+		return m.invokeHeapDestroy
 	default:
 		return nil
 	}
 }
 
 func (m *Machine) builtinWriteString() error {
-	_, err := m.stdout.Write(m.readCString(m.regs[regEDX]))
-	return err
+	return m.writeConsoleBytes(m.stdout, m.readCString(m.regs[regEDX]))
 }
 
 func (m *Machine) builtinCrlf() error {
@@ -1773,8 +2478,7 @@ func (m *Machine) builtinWriteDec() error {
 }
 
 func (m *Machine) builtinWriteChar() error {
-	_, err := m.stdout.Write([]byte{byte(m.regs[regEAX])})
-	return err
+	return m.writeConsoleBytes(m.stdout, []byte{byte(m.regs[regEAX])})
 }
 
 func (m *Machine) builtinWriteHex() error {
@@ -1984,6 +2688,7 @@ func (m *Machine) builtinReadKeyFlush() error {
 func (m *Machine) builtinClrscr() error {
 	_, err := io.WriteString(m.stdout, "\x1b[2J\x1b[H")
 	m.cursorX, m.cursorY = 0, 0
+	m.consoleCells = map[uint64]consoleCell{}
 	return err
 }
 
@@ -2111,11 +2816,12 @@ func (m *Machine) builtinCreateOutputFile() error {
 	name := string(m.readCString(m.regs[regEDX]))
 	file, err := os.Create(name)
 	if err != nil {
-		m.lastError = err.Error()
+		m.setOSError(err)
 		m.regs[regEAX] = 0xFFFFFFFF
 		return nil
 	}
 	m.regs[regEAX] = m.storeHandle(file)
+	m.clearLastError()
 	return nil
 }
 
@@ -2123,11 +2829,12 @@ func (m *Machine) builtinOpenInputFile() error {
 	name := string(m.readCString(m.regs[regEDX]))
 	file, err := os.Open(name)
 	if err != nil {
-		m.lastError = err.Error()
+		m.setOSError(err)
 		m.regs[regEAX] = 0xFFFFFFFF
 		return nil
 	}
 	m.regs[regEAX] = m.storeHandle(file)
+	m.clearLastError()
 	return nil
 }
 
@@ -2135,18 +2842,23 @@ func (m *Machine) builtinCloseFile() error {
 	handle := m.regs[regEAX]
 	file, ok := m.files[handle]
 	if !ok {
-		m.lastError = "invalid file handle"
+		m.setLastError(6, "invalid file handle")
 		return nil
 	}
 	delete(m.files, handle)
-	return file.Close()
+	if err := file.Close(); err != nil {
+		m.setOSError(err)
+		return err
+	}
+	m.clearLastError()
+	return nil
 }
 
 func (m *Machine) builtinReadFromFile() error {
 	handle := m.regs[regEAX]
 	file, ok := m.files[handle]
 	if !ok {
-		m.lastError = "invalid file handle"
+		m.setLastError(6, "invalid file handle")
 		m.cf = true
 		m.regs[regEAX] = 0
 		return nil
@@ -2158,13 +2870,14 @@ func (m *Machine) builtinReadFromFile() error {
 	}
 	n, err := file.Read(m.memory[addr : addr+uint32(count)])
 	if err != nil && err != io.EOF {
-		m.lastError = err.Error()
+		m.setOSError(err)
 		m.cf = true
 		m.regs[regEAX] = 0
 		return nil
 	}
 	m.cf = false
 	m.regs[regEAX] = uint32(n)
+	m.clearLastError()
 	return nil
 }
 
@@ -2172,7 +2885,7 @@ func (m *Machine) builtinWriteToFile() error {
 	handle := m.regs[regEAX]
 	file, ok := m.files[handle]
 	if !ok {
-		m.lastError = "invalid file handle"
+		m.setLastError(6, "invalid file handle")
 		m.cf = true
 		m.regs[regEAX] = 0
 		return nil
@@ -2184,13 +2897,14 @@ func (m *Machine) builtinWriteToFile() error {
 	}
 	n, err := file.Write(m.memory[addr : addr+uint32(count)])
 	if err != nil {
-		m.lastError = err.Error()
+		m.setOSError(err)
 		m.cf = true
 		m.regs[regEAX] = 0
 		return nil
 	}
 	m.cf = false
 	m.regs[regEAX] = uint32(n)
+	m.clearLastError()
 	return nil
 }
 
@@ -2200,6 +2914,700 @@ func (m *Machine) builtinWriteWindowsMsg() error {
 	}
 	_, err := io.WriteString(m.stdout, m.lastError+"\r\n")
 	return err
+}
+
+func (m *Machine) builtinSetConsoleOutputCP() error {
+	if err := m.setConsoleOutputCP(m.stackUint32Arg(0)); err != nil {
+		return err
+	}
+	m.regs[regESP] += 4
+	return nil
+}
+
+func (m *Machine) builtinGetConsoleOutputCP() error {
+	m.regs[regEAX] = m.outputCodePage
+	return nil
+}
+
+func (m *Machine) builtinSetConsoleCP() error {
+	if err := m.setConsoleCP(m.stackUint32Arg(0)); err != nil {
+		return err
+	}
+	m.regs[regESP] += 4
+	return nil
+}
+
+func (m *Machine) builtinGetConsoleCP() error {
+	m.regs[regEAX] = m.inputCodePage
+	return nil
+}
+
+func (m *Machine) builtinMsgBox() error {
+	originalEAX := m.regs[regEAX]
+	if err := m.showMessageBox(m.regs[regEDX], m.regs[regEBX], 0); err != nil {
+		return err
+	}
+	m.regs[regEAX] = originalEAX
+	return nil
+}
+
+func (m *Machine) builtinMsgBoxAsk() error {
+	return m.showMessageBox(m.regs[regEDX], m.regs[regEBX], 0x00000004|0x00000020)
+}
+
+func (m *Machine) builtinPrintf() error {
+	return m.printfWithReader(newStackCArgReader(m, m.regs[regESP]))
+}
+
+func (m *Machine) builtinScanf() error {
+	return m.scanfWithReader(newStackCArgReader(m, m.regs[regESP]))
+}
+
+func (m *Machine) builtinSystem() error {
+	return m.systemWithReader(newStackCArgReader(m, m.regs[regESP]))
+}
+
+func (m *Machine) builtinFopen() error {
+	return m.fopenWithReader(newStackCArgReader(m, m.regs[regESP]))
+}
+
+func (m *Machine) builtinFclose() error {
+	return m.fcloseWithReader(newStackCArgReader(m, m.regs[regESP]))
+}
+
+func (m *Machine) builtinMessageBox() error {
+	if err := m.messageBoxWithReader(newStackCArgReader(m, m.regs[regESP])); err != nil {
+		return err
+	}
+	m.regs[regESP] += 16
+	return nil
+}
+
+func (m *Machine) builtinFormatMessage() error {
+	if err := m.formatMessageWithReader(newStackCArgReader(m, m.regs[regESP])); err != nil {
+		return err
+	}
+	m.regs[regESP] += 28
+	return nil
+}
+
+func (m *Machine) builtinLocalFree() error {
+	if err := m.localFreeWithReader(newStackCArgReader(m, m.regs[regESP])); err != nil {
+		return err
+	}
+	m.regs[regESP] += 4
+	return nil
+}
+
+func (m *Machine) invokePrintf(args []Operand) error {
+	return m.printfWithReader(newInvokeCArgReader(m, args))
+}
+
+func (m *Machine) invokeScanf(args []Operand) error {
+	return m.scanfWithReader(newInvokeCArgReader(m, args))
+}
+
+func (m *Machine) invokeSystem(args []Operand) error {
+	return m.systemWithReader(newInvokeCArgReader(m, args))
+}
+
+func (m *Machine) invokeFopen(args []Operand) error {
+	return m.fopenWithReader(newInvokeCArgReader(m, args))
+}
+
+func (m *Machine) invokeFclose(args []Operand) error {
+	return m.fcloseWithReader(newInvokeCArgReader(m, args))
+}
+
+func (m *Machine) invokeMessageBox(args []Operand) error {
+	return m.messageBoxWithReader(newInvokeCArgReader(m, args))
+}
+
+func (m *Machine) invokeFormatMessage(args []Operand) error {
+	return m.formatMessageWithReader(newInvokeCArgReader(m, args))
+}
+
+func (m *Machine) invokeLocalFree(args []Operand) error {
+	return m.localFreeWithReader(newInvokeCArgReader(m, args))
+}
+
+func (m *Machine) invokeSetConsoleOutputCP(args []Operand) error {
+	if len(args) != 1 {
+		return fmt.Errorf("SetConsoleOutputCP expects one argument")
+	}
+	value, _, err := m.resolveValue(args[0], 4)
+	if err != nil {
+		return err
+	}
+	return m.setConsoleOutputCP(value)
+}
+
+func (m *Machine) invokeGetConsoleOutputCP(args []Operand) error {
+	if len(args) != 0 {
+		return fmt.Errorf("GetConsoleOutputCP expects no arguments")
+	}
+	m.regs[regEAX] = m.outputCodePage
+	return nil
+}
+
+func (m *Machine) invokeSetConsoleCP(args []Operand) error {
+	if len(args) != 1 {
+		return fmt.Errorf("SetConsoleCP expects one argument")
+	}
+	value, _, err := m.resolveValue(args[0], 4)
+	if err != nil {
+		return err
+	}
+	return m.setConsoleCP(value)
+}
+
+func (m *Machine) invokeGetConsoleCP(args []Operand) error {
+	if len(args) != 0 {
+		return fmt.Errorf("GetConsoleCP expects no arguments")
+	}
+	m.regs[regEAX] = m.inputCodePage
+	return nil
+}
+
+func (m *Machine) messageBoxWithReader(reader *cArgReader) error {
+	if _, err := reader.nextUint32(); err != nil {
+		return err
+	}
+	textAddr, err := reader.nextAddress()
+	if err != nil {
+		return err
+	}
+	captionAddr, err := reader.nextAddress()
+	if err != nil {
+		return err
+	}
+	style, err := reader.nextUint32()
+	if err != nil {
+		return err
+	}
+	return m.showMessageBox(textAddr, captionAddr, style)
+}
+
+func (m *Machine) formatMessageWithReader(reader *cArgReader) error {
+	flags, err := reader.nextUint32()
+	if err != nil {
+		return err
+	}
+	if _, err := reader.nextUint32(); err != nil {
+		return err
+	}
+	messageID, err := reader.nextUint32()
+	if err != nil {
+		return err
+	}
+	if _, err := reader.nextUint32(); err != nil {
+		return err
+	}
+	bufferArg, err := reader.nextAddress()
+	if err != nil {
+		return err
+	}
+	size, err := reader.nextUint32()
+	if err != nil {
+		return err
+	}
+	if _, err := reader.nextUint32(); err != nil {
+		return err
+	}
+	message := m.windowsErrorMessage(messageID)
+	if flags&0x00000100 != 0 {
+		addr, ok := m.heapAlloc(processHeapHandle, 0x00000008, uint32(len(message)+1))
+		if !ok {
+			m.regs[regEAX] = 0
+			return nil
+		}
+		if err := m.writeCString(addr, message); err != nil {
+			return err
+		}
+		if err := m.writeMemory(bufferArg, addr, 4); err != nil {
+			return err
+		}
+		m.regs[regEAX] = uint32(len(message))
+		m.lastErrorCode = 0
+		m.lastError = ""
+		return nil
+	}
+	if bufferArg == 0 || size == 0 {
+		m.lastErrorCode = 87
+		m.lastError = "invalid parameter"
+		m.regs[regEAX] = 0
+		return nil
+	}
+	written := message
+	if len(written) >= int(size) {
+		written = written[:int(size)-1]
+	}
+	if err := m.writeCString(bufferArg, written); err != nil {
+		return err
+	}
+	m.regs[regEAX] = uint32(len(written))
+	m.lastErrorCode = 0
+	m.lastError = ""
+	return nil
+}
+
+func (m *Machine) localFreeWithReader(reader *cArgReader) error {
+	addr, err := reader.nextUint32()
+	if err != nil {
+		return err
+	}
+	if m.heapFree(processHeapHandle, addr) {
+		m.regs[regEAX] = 0
+		return nil
+	}
+	m.regs[regEAX] = addr
+	return nil
+}
+
+func (m *Machine) printfWithReader(reader *cArgReader) error {
+	formatAddr, err := reader.nextAddress()
+	if err != nil {
+		return err
+	}
+	text, err := m.formatPrintf(string(m.readCString(formatAddr)), reader)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(m.stdout, text); err != nil {
+		m.lastError = err.Error()
+		m.regs[regEAX] = 0xFFFFFFFF
+		return nil
+	}
+	m.lastError = ""
+	m.regs[regEAX] = uint32(len(text))
+	return nil
+}
+
+func (m *Machine) scanfWithReader(reader *cArgReader) error {
+	formatAddr, err := reader.nextAddress()
+	if err != nil {
+		return err
+	}
+	line, err := m.readLine()
+	if err != nil {
+		return err
+	}
+	tokens := strings.Fields(line)
+	tokenIndex := 0
+	assigned := 0
+	format := string(m.readCString(formatAddr))
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' {
+			continue
+		}
+		if i+1 < len(format) && format[i+1] == '%' {
+			i++
+			continue
+		}
+		spec, next, ok := parseCFormatDirective(format, i+1)
+		if !ok {
+			break
+		}
+		i = next
+		if tokenIndex >= len(tokens) {
+			break
+		}
+		token := tokens[tokenIndex]
+		switch spec.Verb {
+		case 's':
+			addr, err := reader.nextAddress()
+			if err != nil {
+				return err
+			}
+			if err := m.writeCString(addr, token); err != nil {
+				return err
+			}
+		case 'd', 'i':
+			addr, err := reader.nextAddress()
+			if err != nil {
+				return err
+			}
+			value, ok := parseSignedInput(token, 10, 32)
+			if !ok {
+				m.regs[regEAX] = uint32(assigned)
+				return nil
+			}
+			if err := m.writeMemory(addr, uint32(int32(value)), 4); err != nil {
+				return err
+			}
+		case 'u':
+			addr, err := reader.nextAddress()
+			if err != nil {
+				return err
+			}
+			value, ok := parseUnsignedInput(token, 10, 32)
+			if !ok {
+				m.regs[regEAX] = uint32(assigned)
+				return nil
+			}
+			if err := m.writeMemory(addr, uint32(value), 4); err != nil {
+				return err
+			}
+		case 'x', 'X':
+			addr, err := reader.nextAddress()
+			if err != nil {
+				return err
+			}
+			clean := strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(token), "0x"), "0x")
+			value, ok := parseUnsignedInput(clean, 16, 32)
+			if !ok {
+				m.regs[regEAX] = uint32(assigned)
+				return nil
+			}
+			if err := m.writeMemory(addr, uint32(value), 4); err != nil {
+				return err
+			}
+		case 'f':
+			addr, err := reader.nextAddress()
+			if err != nil {
+				return err
+			}
+			value, parseErr := strconv.ParseFloat(token, 64)
+			if parseErr != nil {
+				m.regs[regEAX] = uint32(assigned)
+				return nil
+			}
+			if spec.Length == "l" || spec.Length == "ll" || spec.Length == "L" {
+				if err := m.writeMemory64(addr, math.Float64bits(value)); err != nil {
+					return err
+				}
+			} else {
+				if err := m.writeMemory(addr, math.Float32bits(float32(value)), 4); err != nil {
+					return err
+				}
+			}
+		case 'c':
+			addr, err := reader.nextAddress()
+			if err != nil {
+				return err
+			}
+			if err := m.writeMemory(addr, uint32(token[0]), 1); err != nil {
+				return err
+			}
+		default:
+			continue
+		}
+		tokenIndex++
+		assigned++
+	}
+	m.lastError = ""
+	m.regs[regEAX] = uint32(assigned)
+	return nil
+}
+
+func (m *Machine) systemWithReader(reader *cArgReader) error {
+	commandAddr, err := reader.nextAddress()
+	if err != nil {
+		return err
+	}
+	command := strings.TrimSpace(strings.ToLower(string(m.readCString(commandAddr))))
+	switch command {
+	case "", "pause":
+	case "cls":
+		if err := m.builtinClrscr(); err != nil {
+			return err
+		}
+	case "dir", "dir/w":
+		entries, err := os.ReadDir(".")
+		if err != nil {
+			m.lastError = err.Error()
+			m.regs[regEAX] = 0xFFFFFFFF
+			return nil
+		}
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		if len(names) > 0 {
+			if _, err := io.WriteString(m.stdout, strings.Join(names, "\r\n")+"\r\n"); err != nil {
+				return err
+			}
+		}
+	}
+	m.lastError = ""
+	m.regs[regEAX] = 0
+	return nil
+}
+
+func (m *Machine) fopenWithReader(reader *cArgReader) error {
+	filenameAddr, err := reader.nextAddress()
+	if err != nil {
+		return err
+	}
+	modeAddr, err := reader.nextAddress()
+	if err != nil {
+		return err
+	}
+	file, err := openCFile(string(m.readCString(filenameAddr)), string(m.readCString(modeAddr)))
+	if err != nil {
+		m.lastError = err.Error()
+		m.regs[regEAX] = 0
+		return nil
+	}
+	m.lastError = ""
+	m.regs[regEAX] = m.storeHandle(file)
+	return nil
+}
+
+func (m *Machine) fcloseWithReader(reader *cArgReader) error {
+	handle, err := reader.nextUint32()
+	if err != nil {
+		return err
+	}
+	file, ok := m.files[handle]
+	if !ok {
+		m.lastError = "invalid file handle"
+		m.regs[regEAX] = 0xFFFFFFFF
+		return nil
+	}
+	delete(m.files, handle)
+	if err := file.Close(); err != nil {
+		m.lastError = err.Error()
+		m.regs[regEAX] = 0xFFFFFFFF
+		return nil
+	}
+	m.lastError = ""
+	m.regs[regEAX] = 0
+	return nil
+}
+
+func (m *Machine) formatPrintf(format string, reader *cArgReader) (string, error) {
+	var out strings.Builder
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' {
+			out.WriteByte(format[i])
+			continue
+		}
+		if i+1 < len(format) && format[i+1] == '%' {
+			out.WriteByte('%')
+			i++
+			continue
+		}
+		spec, next, ok := parseCFormatDirective(format, i+1)
+		if !ok {
+			out.WriteByte('%')
+			break
+		}
+		i = next
+		value, err := m.formatPrintfArg(spec, reader)
+		if err != nil {
+			return "", err
+		}
+		out.WriteString(value)
+	}
+	return out.String(), nil
+}
+
+func (m *Machine) formatPrintfArg(spec cFormatSpec, reader *cArgReader) (string, error) {
+	goFormat := cPrintfVerb(spec)
+	switch spec.Verb {
+	case 's':
+		addr, err := reader.nextAddress()
+		if err != nil {
+			return "", err
+		}
+		text := string(m.readCString(addr))
+		if spec.Precision >= 0 && spec.Precision < len(text) {
+			text = text[:spec.Precision]
+		}
+		return fmt.Sprintf(goFormat, text), nil
+	case 'd', 'i':
+		value, err := reader.nextUint32()
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf(goFormat, int32(value)), nil
+	case 'u':
+		value, err := reader.nextUint32()
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf(goFormat, value), nil
+	case 'x', 'X':
+		value, err := reader.nextUint32()
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf(goFormat, value), nil
+	case 'c':
+		value, err := reader.nextUint32()
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf(goFormat, rune(byte(value))), nil
+	case 'f':
+		value, err := reader.nextDouble()
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf(goFormat, value), nil
+	default:
+		return "", fmt.Errorf("unsupported printf format %%%s%c", spec.Length, spec.Verb)
+	}
+}
+
+func newInvokeCArgReader(m *Machine, operands []Operand) *cArgReader {
+	return &cArgReader{machine: m, operands: operands}
+}
+
+func newStackCArgReader(m *Machine, stackBase uint32) *cArgReader {
+	return &cArgReader{machine: m, stackBase: stackBase, fromStack: true}
+}
+
+func (r *cArgReader) nextUint32() (uint32, error) {
+	if r.fromStack {
+		value, err := r.machine.readMemory(r.stackBase+r.stackOffset, 4)
+		if err != nil {
+			return 0, err
+		}
+		r.stackOffset += 4
+		return value, nil
+	}
+	op, err := r.nextOperand()
+	if err != nil {
+		return 0, err
+	}
+	value, _, err := r.machine.resolveValue(op, 4)
+	return value, err
+}
+
+func (r *cArgReader) nextAddress() (uint32, error) {
+	if r.fromStack {
+		return r.nextUint32()
+	}
+	op, err := r.nextOperand()
+	if err != nil {
+		return 0, err
+	}
+	return r.machine.requireAddress(op)
+}
+
+func (r *cArgReader) nextDouble() (float64, error) {
+	if r.fromStack {
+		value, err := r.machine.readMemory64(r.stackBase + r.stackOffset)
+		if err != nil {
+			return 0, err
+		}
+		r.stackOffset += 8
+		return math.Float64frombits(value), nil
+	}
+	op, err := r.nextOperand()
+	if err != nil {
+		return 0, err
+	}
+	return r.machine.readFloatOperand(op)
+}
+
+func (r *cArgReader) nextOperand() (Operand, error) {
+	if r.index >= len(r.operands) {
+		return Operand{}, fmt.Errorf("not enough arguments for C runtime call")
+	}
+	op := r.operands[r.index]
+	r.index++
+	return op, nil
+}
+
+func parseCFormatDirective(format string, start int) (cFormatSpec, int, bool) {
+	spec := cFormatSpec{Precision: -1}
+	i := start
+	for i < len(format) && strings.ContainsRune("-+ #0", rune(format[i])) {
+		spec.Flags += string(format[i])
+		i++
+	}
+	widthStart := i
+	for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+		i++
+	}
+	spec.Width = format[widthStart:i]
+	if i < len(format) && format[i] == '.' {
+		i++
+		precisionStart := i
+		for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+			i++
+		}
+		if precisionStart == i {
+			spec.Precision = 0
+		} else {
+			value, err := strconv.Atoi(format[precisionStart:i])
+			if err == nil {
+				spec.Precision = value
+			}
+		}
+	}
+	if i < len(format) {
+		switch format[i] {
+		case 'h', 'l', 'L':
+			spec.Length = string(format[i])
+			i++
+			if spec.Length == "l" && i < len(format) && format[i] == 'l' {
+				spec.Length = "ll"
+				i++
+			}
+		}
+	}
+	if i >= len(format) {
+		return spec, len(format), false
+	}
+	spec.Verb = format[i]
+	return spec, i, true
+}
+
+func cPrintfVerb(spec cFormatSpec) string {
+	verb := spec.Verb
+	switch verb {
+	case 'i', 'u':
+		verb = 'd'
+	case 's', 'd', 'x', 'X', 'c', 'f':
+	default:
+		verb = spec.Verb
+	}
+	var builder strings.Builder
+	builder.WriteByte('%')
+	for _, flag := range spec.Flags {
+		if strings.ContainsRune("-+ #0", flag) {
+			builder.WriteRune(flag)
+		}
+	}
+	builder.WriteString(spec.Width)
+	if spec.Precision >= 0 {
+		builder.WriteByte('.')
+		builder.WriteString(strconv.Itoa(spec.Precision))
+	}
+	builder.WriteByte(verb)
+	return builder.String()
+}
+
+func openCFile(name string, mode string) (*os.File, error) {
+	cleanMode := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(mode)), "b", "")
+	switch {
+	case strings.HasPrefix(cleanMode, "a"):
+		flags := os.O_CREATE | os.O_APPEND
+		if strings.Contains(cleanMode, "+") {
+			flags |= os.O_RDWR
+		} else {
+			flags |= os.O_WRONLY
+		}
+		return os.OpenFile(name, flags, 0o666)
+	case strings.HasPrefix(cleanMode, "w"):
+		flags := os.O_CREATE | os.O_TRUNC
+		if strings.Contains(cleanMode, "+") {
+			flags |= os.O_RDWR
+		} else {
+			flags |= os.O_WRONLY
+		}
+		return os.OpenFile(name, flags, 0o666)
+	default:
+		flags := os.O_RDONLY
+		if strings.Contains(cleanMode, "+") {
+			flags = os.O_RDWR
+		}
+		return os.OpenFile(name, flags, 0o666)
+	}
 }
 
 func (m *Machine) invokeStrLength(args []Operand) error {
@@ -2289,11 +3697,12 @@ func (m *Machine) invokeCreateFile(args []Operand) error {
 	name := string(m.readCString(nameAddr))
 	file, err := openCreateFile(name, access, disposition)
 	if err != nil {
-		m.lastError = err.Error()
+		m.setOSError(err)
 		m.regs[regEAX] = 0xFFFFFFFF
 		return nil
 	}
 	m.regs[regEAX] = m.storeHandle(file)
+	m.clearLastError()
 	return nil
 }
 
@@ -2307,7 +3716,7 @@ func (m *Machine) invokeReadFile(args []Operand) error {
 	}
 	file, ok := m.files[handle]
 	if !ok {
-		m.lastError = "invalid file handle"
+		m.setLastError(6, "invalid file handle")
 		m.regs[regEAX] = 0
 		return nil
 	}
@@ -2325,13 +3734,14 @@ func (m *Machine) invokeReadFile(args []Operand) error {
 	}
 	n, readErr := file.Read(m.memory[bufferAddr : bufferAddr+count])
 	if readErr != nil && readErr != io.EOF {
-		m.lastError = readErr.Error()
+		m.setOSError(readErr)
 		m.regs[regEAX] = 0
 		_ = m.writeMemory(outAddr, 0, 4)
 		return nil
 	}
 	_ = m.writeMemory(outAddr, uint32(n), 4)
 	m.regs[regEAX] = 1
+	m.clearLastError()
 	return nil
 }
 
@@ -2345,7 +3755,7 @@ func (m *Machine) invokeWriteFile(args []Operand) error {
 	}
 	file, ok := m.files[handle]
 	if !ok {
-		m.lastError = "invalid file handle"
+		m.setLastError(6, "invalid file handle")
 		m.regs[regEAX] = 0
 		return nil
 	}
@@ -2363,13 +3773,14 @@ func (m *Machine) invokeWriteFile(args []Operand) error {
 	}
 	n, writeErr := file.Write(m.memory[bufferAddr : bufferAddr+count])
 	if writeErr != nil {
-		m.lastError = writeErr.Error()
+		m.setOSError(writeErr)
 		m.regs[regEAX] = 0
 		_ = m.writeMemory(outAddr, 0, 4)
 		return nil
 	}
 	_ = m.writeMemory(outAddr, uint32(n), 4)
 	m.regs[regEAX] = 1
+	m.clearLastError()
 	return nil
 }
 
@@ -2383,16 +3794,84 @@ func (m *Machine) invokeCloseHandle(args []Operand) error {
 	}
 	file, ok := m.files[handle]
 	if !ok {
+		m.setLastError(6, "invalid file handle")
 		m.regs[regEAX] = 0
 		return nil
 	}
 	delete(m.files, handle)
 	if err := file.Close(); err != nil {
-		m.lastError = err.Error()
+		m.setOSError(err)
 		m.regs[regEAX] = 0
 		return nil
 	}
 	m.regs[regEAX] = 1
+	m.clearLastError()
+	return nil
+}
+
+func (m *Machine) invokeSetFilePointer(args []Operand) error {
+	if len(args) != 4 {
+		return fmt.Errorf("SetFilePointer expects four arguments")
+	}
+	handle, _, err := m.resolveValue(args[0], 4)
+	if err != nil {
+		return err
+	}
+	file, ok := m.files[handle]
+	if !ok {
+		m.setLastError(6, "invalid file handle")
+		m.regs[regEAX] = 0xFFFFFFFF
+		return nil
+	}
+	low, _, err := m.resolveValue(args[1], 4)
+	if err != nil {
+		return err
+	}
+	highPtr, _, err := m.resolveValue(args[2], 4)
+	if err != nil {
+		return err
+	}
+	moveMethod, _, err := m.resolveValue(args[3], 4)
+	if err != nil {
+		return err
+	}
+	distance := int64(int32(low))
+	if highPtr != 0 {
+		high, err := m.readMemory(highPtr, 4)
+		if err != nil {
+			return err
+		}
+		distance = (int64(int32(high)) << 32) | int64(low)
+	}
+	var whence int
+	switch moveMethod {
+	case 0:
+		whence = io.SeekStart
+	case 1:
+		whence = io.SeekCurrent
+	case 2:
+		whence = io.SeekEnd
+	default:
+		m.setLastError(87, "invalid move method")
+		m.regs[regEAX] = 0xFFFFFFFF
+		return nil
+	}
+	position, err := file.Seek(distance, whence)
+	if err != nil {
+		m.setOSError(err)
+		if m.lastErrorCode == 0 {
+			m.lastErrorCode = 87
+		}
+		m.regs[regEAX] = 0xFFFFFFFF
+		return nil
+	}
+	if highPtr != 0 {
+		if err := m.writeMemory(highPtr, uint32(position>>32), 4); err != nil {
+			return err
+		}
+	}
+	m.regs[regEAX] = uint32(position)
+	m.clearLastError()
 	return nil
 }
 
@@ -2496,6 +3975,14 @@ func (m *Machine) invokeGetNumberOfConsoleInputEvents(args []Operand) error {
 	return nil
 }
 
+func (m *Machine) invokeGetLastError(args []Operand) error {
+	if len(args) != 0 {
+		return fmt.Errorf("GetLastError expects no arguments")
+	}
+	m.regs[regEAX] = m.lastErrorCode
+	return nil
+}
+
 func (m *Machine) invokeGetKeyState(args []Operand) error {
 	if len(args) != 1 {
 		return fmt.Errorf("GetKeyState expects one argument")
@@ -2507,11 +3994,29 @@ func (m *Machine) invokeGetKeyState(args []Operand) error {
 	var value uint32
 	switch key {
 	case 0x90:
+		value = 1
+	case 0x14, 0x91:
+		value = 0
+	case 0xA0, 0xA1:
 		value = 0
 	default:
 		value = 0
 	}
 	m.regs[regEAX] = value
+	return nil
+}
+
+func (m *Machine) invokeSetConsoleTextAttribute(args []Operand) error {
+	if len(args) != 2 {
+		return fmt.Errorf("SetConsoleTextAttribute expects two arguments")
+	}
+	attr, _, err := m.resolveValue(args[1], 4)
+	if err != nil {
+		return err
+	}
+	m.colorAttr = attr & 0xFFFF
+	m.regs[regEAX] = 1
+	m.lastErrorCode = 0
 	return nil
 }
 
@@ -2541,9 +4046,9 @@ func (m *Machine) invokeWriteConsole(args []Operand) error {
 	data := m.memory[bufferAddr : bufferAddr+count]
 	switch handle {
 	case stdErrorHandleValue:
-		_, err = m.stderr.Write(data)
+		err = m.writeConsoleBytes(m.stderr, data)
 	default:
-		_, err = m.stdout.Write(data)
+		err = m.writeConsoleBytes(m.stdout, data)
 	}
 	if err != nil {
 		m.lastError = err.Error()
@@ -2552,6 +4057,102 @@ func (m *Machine) invokeWriteConsole(args []Operand) error {
 		return nil
 	}
 	_ = m.writeMemory(writtenAddr, count, 4)
+	m.regs[regEAX] = 1
+	return nil
+}
+
+func (m *Machine) invokeWriteConsoleOutputCharacter(args []Operand) error {
+	if len(args) != 5 {
+		return fmt.Errorf("WriteConsoleOutputCharacter expects five arguments")
+	}
+	handle, _, err := m.resolveValue(args[0], 4)
+	if err != nil {
+		return err
+	}
+	bufferAddr, err := m.requireAddress(args[1])
+	if err != nil {
+		return err
+	}
+	count, _, err := m.resolveValue(args[2], 4)
+	if err != nil {
+		return err
+	}
+	x, y, err := m.readCoordOperand(args[3])
+	if err != nil {
+		return err
+	}
+	writtenAddr, err := m.requireAddress(args[4])
+	if err != nil {
+		return err
+	}
+	if !isConsoleOutputHandle(handle) {
+		m.lastErrorCode = 6
+		m.lastError = "invalid console handle"
+		_ = m.writeMemory(writtenAddr, 0, 4)
+		m.regs[regEAX] = 0
+		return nil
+	}
+	if int(bufferAddr)+int(count) > len(m.memory) {
+		return fmt.Errorf("WriteConsoleOutputCharacter buffer exceeds memory")
+	}
+	m.writeConsoleChars(int(int16(x)), int(int16(y)), m.memory[bufferAddr:bufferAddr+count])
+	if err := m.writeMemory(writtenAddr, count, 4); err != nil {
+		return err
+	}
+	m.lastErrorCode = 0
+	m.lastError = ""
+	m.regs[regEAX] = 1
+	return nil
+}
+
+func (m *Machine) invokeWriteConsoleOutputAttribute(args []Operand) error {
+	if len(args) != 5 {
+		return fmt.Errorf("WriteConsoleOutputAttribute expects five arguments")
+	}
+	handle, _, err := m.resolveValue(args[0], 4)
+	if err != nil {
+		return err
+	}
+	bufferAddr, err := m.requireAddress(args[1])
+	if err != nil {
+		return err
+	}
+	count, _, err := m.resolveValue(args[2], 4)
+	if err != nil {
+		return err
+	}
+	x, y, err := m.readCoordOperand(args[3])
+	if err != nil {
+		return err
+	}
+	writtenAddr, err := m.requireAddress(args[4])
+	if err != nil {
+		return err
+	}
+	if !isConsoleOutputHandle(handle) {
+		m.lastErrorCode = 6
+		m.lastError = "invalid console handle"
+		_ = m.writeMemory(writtenAddr, 0, 4)
+		m.regs[regEAX] = 0
+		return nil
+	}
+	if int(bufferAddr)+int(count)*2 > len(m.memory) {
+		return fmt.Errorf("WriteConsoleOutputAttribute buffer exceeds memory")
+	}
+	attrs := make([]uint16, 0, int(count))
+	for i := uint32(0); i < count; i++ {
+		value, err := m.readMemory(bufferAddr+i*2, 2)
+		if err != nil {
+			return err
+		}
+		attrs = append(attrs, uint16(value))
+	}
+	m.writeConsoleAttrs(int(int16(x)), int(int16(y)), attrs)
+	if err := m.writeMemory(writtenAddr, count, 4); err != nil {
+		return err
+	}
+	m.lastErrorCode = 0
+	m.lastError = ""
 	m.regs[regEAX] = 1
 	return nil
 }
@@ -2659,6 +4260,33 @@ func (m *Machine) invokeSetConsoleCursorPosition(args []Operand) error {
 	return err
 }
 
+func (m *Machine) invokeSetConsoleWindowInfo(args []Operand) error {
+	if len(args) != 3 {
+		return fmt.Errorf("SetConsoleWindowInfo expects three arguments")
+	}
+	absolute, _, err := m.resolveValue(args[1], 4)
+	if err != nil {
+		return err
+	}
+	left, top, right, bottom, err := m.readSmallRectOperand(args[2])
+	if err != nil {
+		return err
+	}
+	if absolute == 0 {
+		left += int16(m.windowLeft)
+		top += int16(m.windowTop)
+		right += int16(m.windowRight)
+		bottom += int16(m.windowBottom)
+	}
+	m.windowLeft = int(left)
+	m.windowTop = int(top)
+	m.windowRight = int(right)
+	m.windowBottom = int(bottom)
+	m.regs[regEAX] = 1
+	m.lastErrorCode = 0
+	return nil
+}
+
 func (m *Machine) invokeGetConsoleCursorInfo(args []Operand) error {
 	if len(args) != 2 {
 		return fmt.Errorf("GetConsoleCursorInfo expects two arguments")
@@ -2747,24 +4375,16 @@ func (m *Machine) invokeGetConsoleScreenBufferInfo(args []Operand) error {
 	if err := m.writeMemory(addr+8, m.colorAttr, 2); err != nil {
 		return err
 	}
-	if err := m.writeWord(addr+10, 0); err != nil {
+	if err := m.writeWord(addr+10, uint16(m.windowLeft)); err != nil {
 		return err
 	}
-	if err := m.writeWord(addr+12, 0); err != nil {
+	if err := m.writeWord(addr+12, uint16(m.windowTop)); err != nil {
 		return err
 	}
-	right := m.screenWidth - 1
-	if right < 0 {
-		right = 0
-	}
-	if err := m.writeWord(addr+14, uint16(right)); err != nil {
+	if err := m.writeWord(addr+14, uint16(m.windowRight)); err != nil {
 		return err
 	}
-	bottom := m.screenHeight - 1
-	if bottom < 0 {
-		bottom = 0
-	}
-	if err := m.writeWord(addr+16, uint16(bottom)); err != nil {
+	if err := m.writeWord(addr+16, uint16(m.windowBottom)); err != nil {
 		return err
 	}
 	if err := m.writeCoord(addr+18, uint16(m.screenWidth), uint16(m.screenHeight)); err != nil {
@@ -2836,6 +4456,113 @@ func (m *Machine) invokeWriteStackFrameName(args []Operand) error {
 	return m.writeStackFrame(name, args[:3])
 }
 
+func (m *Machine) invokeExitProcess(args []Operand) error {
+	code := 0
+	if len(args) > 0 {
+		value, _, err := m.resolveValue(args[0], 4)
+		if err != nil {
+			return err
+		}
+		code = int(int32(value))
+	}
+	m.exitCode = code
+	m.regs[regEAX] = uint32(code)
+	m.terminated = true
+	return nil
+}
+
+func (m *Machine) invokeGetProcessHeap(args []Operand) error {
+	if len(args) != 0 {
+		return fmt.Errorf("GetProcessHeap expects no arguments")
+	}
+	m.regs[regEAX] = processHeapHandle
+	return nil
+}
+
+func (m *Machine) invokeHeapCreate(args []Operand) error {
+	if len(args) < 3 {
+		return fmt.Errorf("HeapCreate expects three arguments")
+	}
+	handle := m.nextHeapHandle
+	m.nextHeapHandle++
+	m.heapHandles[handle] = true
+	m.regs[regEAX] = handle
+	m.lastErrorCode = 0
+	m.lastError = ""
+	return nil
+}
+
+func (m *Machine) invokeHeapDestroy(args []Operand) error {
+	if len(args) != 1 {
+		return fmt.Errorf("HeapDestroy expects one argument")
+	}
+	handle, _, err := m.resolveValue(args[0], 4)
+	if err != nil {
+		return err
+	}
+	if handle == processHeapHandle || !m.heapHandles[handle] {
+		m.regs[regEAX] = 0
+		m.lastErrorCode = 6
+		m.lastError = "invalid heap handle"
+		return nil
+	}
+	delete(m.heapHandles, handle)
+	for addr, block := range m.heapAllocs {
+		if block.handle == handle {
+			delete(m.heapAllocs, addr)
+		}
+	}
+	m.regs[regEAX] = 1
+	m.lastErrorCode = 0
+	m.lastError = ""
+	return nil
+}
+
+func (m *Machine) invokeHeapAlloc(args []Operand) error {
+	if len(args) < 3 {
+		return fmt.Errorf("HeapAlloc expects three arguments")
+	}
+	handle, _, err := m.resolveValue(args[0], 4)
+	if err != nil {
+		return err
+	}
+	flags, _, err := m.resolveValue(args[1], 4)
+	if err != nil {
+		return err
+	}
+	size, _, err := m.resolveValue(args[2], 4)
+	if err != nil {
+		return err
+	}
+	addr, ok := m.heapAlloc(handle, flags, size)
+	if !ok {
+		m.regs[regEAX] = 0
+		return nil
+	}
+	m.regs[regEAX] = addr
+	return nil
+}
+
+func (m *Machine) invokeHeapFree(args []Operand) error {
+	if len(args) < 3 {
+		return fmt.Errorf("HeapFree expects three arguments")
+	}
+	handle, _, err := m.resolveValue(args[0], 4)
+	if err != nil {
+		return err
+	}
+	addr, _, err := m.resolveValue(args[2], 4)
+	if err != nil {
+		return err
+	}
+	if m.heapFree(handle, addr) {
+		m.regs[regEAX] = 1
+		return nil
+	}
+	m.regs[regEAX] = 0
+	return nil
+}
+
 func (m *Machine) writeStackFrame(name string, args []Operand) error {
 	params, _, err := m.resolveValue(args[0], 4)
 	if err != nil {
@@ -2897,6 +4624,30 @@ func (m *Machine) readCoordOperand(op Operand) (uint16, uint16, error) {
 	}
 }
 
+func (m *Machine) readSmallRectOperand(op Operand) (int16, int16, int16, int16, error) {
+	addr, err := m.requireAddress(op)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	left, err := m.readMemory(addr, 2)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	top, err := m.readMemory(addr+2, 2)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	right, err := m.readMemory(addr+4, 2)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	bottom, err := m.readMemory(addr+6, 2)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	return int16(left), int16(top), int16(right), int16(bottom), nil
+}
+
 func (m *Machine) readCoord(addr uint32) (uint16, uint16, error) {
 	x, err := m.readMemory(addr, 2)
 	if err != nil {
@@ -2907,6 +4658,41 @@ func (m *Machine) readCoord(addr uint32) (uint16, uint16, error) {
 		return 0, 0, err
 	}
 	return uint16(x), uint16(y), nil
+}
+
+func (m *Machine) writeConsoleChars(x int, y int, data []byte) {
+	for _, ch := range data {
+		key := consoleCellKey(x, y)
+		cell := m.consoleCells[key]
+		cell.ch = ch
+		cell.hasChar = true
+		if !cell.hasAttr {
+			cell.attr = uint16(m.colorAttr)
+			cell.hasAttr = true
+		}
+		m.consoleCells[key] = cell
+		x, y = m.advanceConsoleCoord(x, y)
+	}
+}
+
+func (m *Machine) writeConsoleAttrs(x int, y int, attrs []uint16) {
+	for _, attr := range attrs {
+		key := consoleCellKey(x, y)
+		cell := m.consoleCells[key]
+		cell.attr = attr
+		cell.hasAttr = true
+		m.consoleCells[key] = cell
+		x, y = m.advanceConsoleCoord(x, y)
+	}
+}
+
+func (m *Machine) advanceConsoleCoord(x int, y int) (int, int) {
+	x++
+	if m.screenWidth > 0 && x >= m.screenWidth {
+		x = 0
+		y++
+	}
+	return x, y
 }
 
 func (m *Machine) writeCoord(addr uint32, x uint16, y uint16) error {
@@ -3535,6 +5321,35 @@ func (m *Machine) readCString(addr uint32) []byte {
 	return out
 }
 
+func (m *Machine) showMessageBox(textAddr, captionAddr, style uint32) error {
+	text := ""
+	if textAddr != 0 {
+		text = string(m.readCString(textAddr))
+	}
+	caption := ""
+	if captionAddr != 0 {
+		caption = string(m.readCString(captionAddr))
+	}
+	if err := m.writeMessageBoxText(caption, text); err != nil {
+		m.lastError = err.Error()
+		m.lastErrorCode = 0
+		return nil
+	}
+	m.regs[regEAX] = m.chooseMessageBoxResult(style)
+	m.lastErrorCode = 0
+	m.lastError = ""
+	return nil
+}
+
+func (m *Machine) writeCString(addr uint32, value string) error {
+	if int(addr)+len(value)+1 > len(m.memory) {
+		return fmt.Errorf("cstring write exceeds memory")
+	}
+	copy(m.memory[addr:], []byte(value))
+	m.memory[int(addr)+len(value)] = 0
+	return nil
+}
+
 func (m *Machine) copyCString(src, dst uint32) error {
 	data := m.readCString(src)
 	if int(dst)+len(data)+1 > len(m.memory) {
@@ -3580,6 +5395,280 @@ func (m *Machine) upperCString(addr uint32) error {
 	}
 	copy(m.memory[addr:], data)
 	return nil
+}
+
+func (m *Machine) writeMessageBoxText(caption, text string) error {
+	var builder strings.Builder
+	builder.WriteString("[MessageBox]")
+	if caption != "" {
+		builder.WriteByte(' ')
+		builder.WriteString(caption)
+	}
+	builder.WriteString("\r\n")
+	builder.WriteString(text)
+	builder.WriteString("\r\n")
+	_, err := io.WriteString(m.stdout, builder.String())
+	return err
+}
+
+func (m *Machine) chooseMessageBoxResult(style uint32) uint32 {
+	options := messageBoxOptions(style)
+	if len(options) == 0 {
+		return 1
+	}
+	if choice, ok := m.readMessageBoxChoice(options, style); ok {
+		return choice
+	}
+	defaultIndex := int((style >> 8) & 0x3)
+	if defaultIndex < 0 || defaultIndex >= len(options) {
+		defaultIndex = 0
+	}
+	return options[defaultIndex]
+}
+
+func (m *Machine) readMessageBoxChoice(options []uint32, style uint32) (uint32, bool) {
+	if len(options) <= 1 || !m.peekableInput {
+		return 0, false
+	}
+	if _, err := m.stdin.Peek(1); err != nil {
+		return 0, false
+	}
+	line, err := m.readLine()
+	if err != nil {
+		return 0, false
+	}
+	choice, ok := parseMessageBoxChoice(line)
+	if !ok {
+		return 0, false
+	}
+	for _, option := range options {
+		if option == choice {
+			return choice, true
+		}
+	}
+	return 0, false
+}
+
+func parseMessageBoxChoice(line string) (uint32, bool) {
+	switch trimmed := strings.TrimSpace(strings.ToLower(line)); {
+	case trimmed == "":
+		return 0, false
+	case strings.HasPrefix(trimmed, "ok"):
+		return 1, true
+	case strings.HasPrefix(trimmed, "yes"), trimmed == "y":
+		return 6, true
+	case strings.HasPrefix(trimmed, "no"), trimmed == "n":
+		return 7, true
+	case strings.HasPrefix(trimmed, "cancel"), trimmed == "c":
+		return 2, true
+	case strings.HasPrefix(trimmed, "abort"):
+		return 3, true
+	case strings.HasPrefix(trimmed, "retry"):
+		return 4, true
+	case strings.HasPrefix(trimmed, "ignore"):
+		return 5, true
+	case strings.HasPrefix(trimmed, "try"):
+		return 10, true
+	case strings.HasPrefix(trimmed, "continue"):
+		return 11, true
+	default:
+		return 0, false
+	}
+}
+
+func messageBoxOptions(style uint32) []uint32 {
+	switch style & 0xF {
+	case 1:
+		return []uint32{1, 2}
+	case 2:
+		return []uint32{3, 4, 5}
+	case 3:
+		return []uint32{6, 7, 2}
+	case 4:
+		return []uint32{6, 7}
+	case 5:
+		return []uint32{4, 2}
+	case 6:
+		return []uint32{2, 10, 11}
+	default:
+		return []uint32{1}
+	}
+}
+
+func (m *Machine) windowsErrorMessage(code uint32) string {
+	switch code {
+	case 2:
+		return "The system cannot find the file specified.\r\n"
+	case 3:
+		return "The system cannot find the path specified.\r\n"
+	case 5:
+		return "Access is denied.\r\n"
+	case 6:
+		return "The handle is invalid.\r\n"
+	case 8:
+		return "Not enough storage is available to process this command.\r\n"
+	case 87:
+		return "The parameter is incorrect.\r\n"
+	case 122:
+		return "The data area passed to a system call is too small.\r\n"
+	default:
+		if code == m.lastErrorCode && m.lastError != "" {
+			text := m.lastError
+			if idx := strings.LastIndex(text, ": "); idx >= 0 && idx+2 < len(text) {
+				text = text[idx+2:]
+			}
+			if !strings.HasSuffix(text, "\r\n") {
+				text += "\r\n"
+			}
+			return text
+		}
+		return fmt.Sprintf("System error %d.\r\n", code)
+	}
+}
+
+func (m *Machine) clearLastError() {
+	m.lastErrorCode = 0
+	m.lastError = ""
+}
+
+func (m *Machine) setLastError(code uint32, message string) {
+	m.lastErrorCode = code
+	m.lastError = message
+}
+
+func (m *Machine) setOSError(err error) {
+	switch {
+	case err == nil:
+		m.clearLastError()
+	case os.IsNotExist(err):
+		m.setLastError(2, err.Error())
+	case os.IsPermission(err):
+		m.setLastError(5, err.Error())
+	default:
+		m.setLastError(1, err.Error())
+	}
+}
+
+func (m *Machine) stackUint32Arg(index uint32) uint32 {
+	value, _ := m.readMemory(m.regs[regESP]+index*4, 4)
+	return value
+}
+
+func (m *Machine) setConsoleOutputCP(codePage uint32) error {
+	m.outputCodePage = codePage
+	m.regs[regEAX] = 1
+	m.clearLastError()
+	return nil
+}
+
+func (m *Machine) setConsoleCP(codePage uint32) error {
+	m.inputCodePage = codePage
+	m.regs[regEAX] = 1
+	m.clearLastError()
+	return nil
+}
+
+func (m *Machine) writeConsoleBytes(w io.Writer, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	_, err := w.Write(m.decodeConsoleBytes(data))
+	return err
+}
+
+func (m *Machine) decodeConsoleBytes(data []byte) []byte {
+	charmapEncoding := consoleCodePageCharmap(m.outputCodePage)
+	if charmapEncoding == nil {
+		return data
+	}
+	decoded, err := charmapEncoding.NewDecoder().Bytes(data)
+	if err != nil {
+		return data
+	}
+	return decoded
+}
+
+func consoleCodePageCharmap(codePage uint32) *charmap.Charmap {
+	switch codePage {
+	case 437:
+		return charmap.CodePage437
+	case 850:
+		return charmap.CodePage850
+	case 852:
+		return charmap.CodePage852
+	case 858:
+		return charmap.CodePage858
+	case 866:
+		return charmap.CodePage866
+	case 874:
+		return charmap.Windows874
+	case 1250:
+		return charmap.Windows1250
+	case 1251:
+		return charmap.Windows1251
+	case 1252:
+		return charmap.Windows1252
+	case 1253:
+		return charmap.Windows1253
+	case 1254:
+		return charmap.Windows1254
+	case 1255:
+		return charmap.Windows1255
+	case 1256:
+		return charmap.Windows1256
+	case 1257:
+		return charmap.Windows1257
+	case 1258:
+		return charmap.Windows1258
+	default:
+		return nil
+	}
+}
+
+func (m *Machine) heapAlloc(handle, flags, size uint32) (uint32, bool) {
+	if !m.heapHandles[handle] {
+		m.lastErrorCode = 6
+		m.lastError = "invalid heap handle"
+		return 0, false
+	}
+	addr := alignUp32(m.heapTop, 4)
+	end := addr + alignUp32(size, 4)
+	if end >= m.regs[regESP] || int(end) > len(m.memory) {
+		m.lastErrorCode = 8
+		m.lastError = "not enough memory"
+		return 0, false
+	}
+	if flags&0x00000008 != 0 {
+		for i := addr; i < end; i++ {
+			m.memory[i] = 0
+		}
+	}
+	m.heapTop = end
+	m.heapAllocs[addr] = heapBlock{handle: handle, size: end - addr}
+	m.lastErrorCode = 0
+	m.lastError = ""
+	return addr, true
+}
+
+func (m *Machine) heapFree(handle, addr uint32) bool {
+	if addr == 0 {
+		m.lastErrorCode = 0
+		m.lastError = ""
+		return true
+	}
+	block, ok := m.heapAllocs[addr]
+	if !ok || block.handle != handle {
+		m.lastErrorCode = 6
+		m.lastError = "invalid heap block"
+		return false
+	}
+	delete(m.heapAllocs, addr)
+	for i := addr; i < addr+block.size && int(i) < len(m.memory); i++ {
+		m.memory[i] = 0
+	}
+	m.lastErrorCode = 0
+	m.lastError = ""
+	return true
 }
 
 func (m *Machine) dumpMemory(addr, count, elemSize uint32) error {
@@ -3787,6 +5876,14 @@ func clampWidth(width int) int {
 	}
 }
 
+func consoleCellKey(x int, y int) uint64 {
+	return (uint64(uint32(y)) << 32) | uint64(uint32(x))
+}
+
+func isConsoleOutputHandle(handle uint32) bool {
+	return handle == stdOutputHandleValue || handle == stdErrorHandleValue
+}
+
 func truncate(value uint32, width int) uint32 {
 	return value & widthMask(width)
 }
@@ -3828,6 +5925,32 @@ func signBit(value uint32, width int) bool {
 	return (value & signMask(width)) != 0
 }
 
+func nextSignBit(value uint32, width int) bool {
+	switch width {
+	case 1:
+		return value&0x40 != 0
+	case 2:
+		return value&0x4000 != 0
+	default:
+		return value&0x40000000 != 0
+	}
+}
+
+func effectiveRotateCount(count uint32, width int, withCarry bool) uint32 {
+	count &= 0x1F
+	if count == 0 {
+		return 0
+	}
+	modulus := uint32(width * 8)
+	if withCarry {
+		modulus++
+	}
+	if modulus == 0 {
+		return 0
+	}
+	return count % modulus
+}
+
 func parity8(v byte) bool {
 	return bits.OnesCount8(v)%2 == 0
 }
@@ -3837,6 +5960,17 @@ func boolToInt(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+func alignUp32(value, align uint32) uint32 {
+	if align == 0 {
+		return value
+	}
+	rem := value % align
+	if rem == 0 {
+		return value
+	}
+	return value + align - rem
 }
 
 func formatHex(value uint32, width int) string {

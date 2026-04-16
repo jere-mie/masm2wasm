@@ -2,6 +2,7 @@ package masm
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -12,6 +13,8 @@ type compileTimeState struct {
 	ints  map[string]int64
 	texts map[string]string
 }
+
+var reIsDefinedCall = regexp.MustCompile(`(?i)\bIsDefined\s*\(\s*([A-Za-z_@?$\.][A-Za-z0-9_@?$\.]*)\s*\)`)
 
 func expandCompileTime(lines []sourceLine) ([]sourceLine, error) {
 	state := &compileTimeState{
@@ -72,6 +75,40 @@ func expandCompileTimeBlock(lines []sourceLine, state *compileTimeState, preserv
 			_, rest := splitOpcode(trimmed)
 			chosen := falseBody
 			if evalIFIDNI(rest) {
+				chosen = trueBody
+			}
+			expanded, err := expandCompileTimeBlock(chosen, state, preserveAssignments, replacements)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, expanded...)
+			i = next
+			continue
+		case strings.EqualFold(opcodeWord(trimmed), "ifdef"):
+			trueBody, falseBody, next, err := collectConditionalBlock(lines, i+1)
+			if err != nil {
+				return nil, err
+			}
+			_, rest := splitOpcode(trimmed)
+			chosen := falseBody
+			if isCompileTimeDefined(rest, state) {
+				chosen = trueBody
+			}
+			expanded, err := expandCompileTimeBlock(chosen, state, preserveAssignments, replacements)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, expanded...)
+			i = next
+			continue
+		case strings.EqualFold(opcodeWord(trimmed), "ifndef"):
+			trueBody, falseBody, next, err := collectConditionalBlock(lines, i+1)
+			if err != nil {
+				return nil, err
+			}
+			_, rest := splitOpcode(trimmed)
+			chosen := falseBody
+			if !isCompileTimeDefined(rest, state) {
 				chosen = trueBody
 			}
 			expanded, err := expandCompileTimeBlock(chosen, state, preserveAssignments, replacements)
@@ -277,7 +314,7 @@ func collectConditionalBlock(lines []sourceLine, start int) (trueBody []sourceLi
 		trimmed := strings.TrimSpace(lines[i].Text)
 		word := strings.ToLower(opcodeWord(trimmed))
 		switch word {
-		case "if", "ifb", "ifidni":
+		case "if", "ifb", "ifidni", "ifdef", "ifndef":
 			depth++
 		case "else":
 			if depth == 0 {
@@ -480,12 +517,39 @@ func evalCompileTimeExpr(lineNo int, expr string, state *compileTimeState) (int6
 }
 
 func evalCompileTimeCondition(lineNo int, text string, state *compileTimeState) (bool, error) {
-	normalized := normalizeConditionText(text)
+	normalized := normalizeConditionText(rewriteIsDefinedCalls(text, state))
 	node, err := parseCondition(lineNo, normalized)
 	if err != nil {
 		return false, err
 	}
 	return evalCompileTimeCondNode(lineNo, node, state)
+}
+
+func rewriteIsDefinedCalls(text string, state *compileTimeState) string {
+	return reIsDefinedCall.ReplaceAllStringFunc(text, func(match string) string {
+		sub := reIsDefinedCall.FindStringSubmatch(match)
+		if len(sub) != 2 {
+			return match
+		}
+		if isCompileTimeDefined(sub[1], state) {
+			return "1"
+		}
+		return "0"
+	})
+}
+
+func isCompileTimeDefined(name string, state *compileTimeState) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	if lower == "" {
+		return false
+	}
+	if _, ok := state.ints[lower]; ok {
+		return true
+	}
+	if _, ok := state.texts[lower]; ok {
+		return true
+	}
+	return false
 }
 
 func normalizeConditionText(text string) string {
@@ -552,6 +616,12 @@ func evalCompileTimeCondNode(lineNo int, node condNode, state *compileTimeState)
 		default:
 			return false, fmt.Errorf("line %d: unsupported compile-time comparison %q", lineNo, n.Op)
 		}
+	case condExpr:
+		value, err := evalCompileTimeExpr(lineNo, n.Expr, state)
+		if err != nil {
+			return false, err
+		}
+		return value != 0, nil
 	default:
 		return false, fmt.Errorf("line %d: unsupported compile-time condition", lineNo)
 	}

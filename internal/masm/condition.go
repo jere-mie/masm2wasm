@@ -19,6 +19,10 @@ type condCompare struct {
 	Right string
 }
 
+type condExpr struct {
+	Expr string
+}
+
 type condAnd struct {
 	Parts []condNode
 }
@@ -165,6 +169,8 @@ func (p *Parser) compileCondFalse(lineNo int, node condNode, falseLabel string) 
 		p.addInst(lineNo, ".IF", "cmp", left, right)
 		p.addInst(lineNo, ".IF", falseJumpForCompare(n.Op), vm.Operand{Kind: "name", Text: falseLabel})
 		return nil
+	case condExpr:
+		return p.compileCondExpr(lineNo, n.Expr, falseLabel, true)
 	case condAnd:
 		for _, part := range n.Parts {
 			if err := p.compileCondFalse(lineNo, part, falseLabel); err != nil {
@@ -211,6 +217,8 @@ func (p *Parser) compileCondTrue(lineNo int, node condNode, trueLabel string) er
 		p.addInst(lineNo, ".IF", "cmp", left, right)
 		p.addInst(lineNo, ".IF", trueJumpForCompare(n.Op), vm.Operand{Kind: "name", Text: trueLabel})
 		return nil
+	case condExpr:
+		return p.compileCondExpr(lineNo, n.Expr, trueLabel, false)
 	case condAnd:
 		skip := p.newSyntheticLabel("if_and")
 		for i, part := range n.Parts {
@@ -238,6 +246,43 @@ func (p *Parser) compileCondTrue(lineNo int, node condNode, trueLabel string) er
 	default:
 		return fmt.Errorf("line %d: unsupported .IF condition", lineNo)
 	}
+}
+
+func (p *Parser) compileCondExpr(lineNo int, expr, label string, falseSense bool) error {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return fmt.Errorf("line %d: unsupported .IF condition", lineNo)
+	}
+	if parts := splitTopLevel(expr, '&'); len(parts) >= 2 {
+		leftText := strings.TrimSpace(parts[0])
+		rightText := strings.TrimSpace(strings.Join(parts[1:], " & "))
+		left, err := p.parseOperand(lineNo, "test", leftText)
+		if err != nil {
+			return err
+		}
+		right, err := p.parseOperand(lineNo, "test", rightText)
+		if err != nil {
+			return err
+		}
+		p.addInst(lineNo, ".IF", "test", left, right)
+		jump := "jnz"
+		if falseSense {
+			jump = "jz"
+		}
+		p.addInst(lineNo, ".IF", jump, vm.Operand{Kind: "name", Text: label})
+		return nil
+	}
+	operand, err := p.parseOperand(lineNo, "cmp", expr)
+	if err != nil {
+		return err
+	}
+	p.addInst(lineNo, ".IF", "cmp", operand, vm.Operand{Kind: "imm", Value: 0})
+	jump := "jne"
+	if falseSense {
+		jump = "je"
+	}
+	p.addInst(lineNo, ".IF", jump, vm.Operand{Kind: "name", Text: label})
+	return nil
 }
 
 func parseCondition(lineNo int, text string) (condNode, error) {
@@ -329,7 +374,7 @@ func (p *condParser) parseCompare() (condNode, error) {
 		return nil, fmt.Errorf("line %d: missing left side of .IF comparison", p.lineNo)
 	}
 	if !p.hasKind("cmp") {
-		return nil, fmt.Errorf("line %d: expected comparison operator in .IF", p.lineNo)
+		return condExpr{Expr: left}, nil
 	}
 	op := p.consume().text
 	right := p.collectValue()

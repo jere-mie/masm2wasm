@@ -50,13 +50,42 @@ func (p *Parser) isAggregateType(name string) bool {
 }
 
 func (p *Parser) typeSize(name string) int {
-	if size := declSize(name); size != 0 {
+	resolved := p.resolveTypeName(name)
+	if size := declSize(p.canonicalTypeName(resolved)); size != 0 {
 		return size
 	}
-	if def, ok := p.aggregates[strings.ToLower(strings.TrimSpace(name))]; ok {
+	if def, ok := p.aggregates[strings.ToLower(strings.TrimSpace(resolved))]; ok {
 		return def.Size
 	}
 	return 0
+}
+
+func (p *Parser) resolveTypeName(name string) string {
+	current := strings.TrimSpace(name)
+	seen := map[string]struct{}{}
+	for {
+		key := strings.ToLower(current)
+		if _, ok := seen[key]; ok {
+			return current
+		}
+		seen[key] = struct{}{}
+		next, ok := p.typeAliases[key]
+		if !ok {
+			return current
+		}
+		current = strings.TrimSpace(next)
+	}
+}
+
+func (p *Parser) canonicalTypeName(name string) string {
+	resolved := p.resolveTypeName(name)
+	lower := strings.ToLower(strings.TrimSpace(resolved))
+	switch {
+	case strings.Contains(lower, "ptr"), strings.Contains(lower, "near32"), strings.Contains(lower, "handle"):
+		return "DWORD"
+	default:
+		return normalizeDecl(resolved)
+	}
 }
 
 func (p *Parser) registerAggregateDef(def aggregateDef) {
@@ -309,26 +338,30 @@ func (p *Parser) parseAggregateField(lineNo int, line string) error {
 	if current.Kind != "union" {
 		offset = int64(current.Size)
 	}
-	size := p.typeSize(decl)
+	resolvedDecl := decl
+	if !p.isAggregateType(decl) {
+		resolvedDecl = p.canonicalTypeName(decl)
+	}
+	size := p.typeSize(resolvedDecl)
 	if size == 0 {
 		return fmt.Errorf("line %d: unknown field type %q", lineNo, decl)
 	}
-	data, items, err := p.parseTypeInitializers(lineNo, decl, initExpr)
+	data, items, err := p.parseTypeInitializers(lineNo, resolvedDecl, initExpr)
 	if err != nil {
 		return err
 	}
 	field := aggregateField{
 		Name:     name,
-		Decl:     decl,
+		Decl:     resolvedDecl,
 		Offset:   offset,
 		Size:     size,
 		Length:   items,
 		ElemSize: size,
 	}
-	if p.isAggregateType(decl) {
-		field.TypeName = decl
+	if p.isAggregateType(resolvedDecl) {
+		field.TypeName = resolvedDecl
 		field.ElemSize = size
-	} else if elem := declSize(decl); elem != 0 {
+	} else if elem := declSize(resolvedDecl); elem != 0 {
 		field.ElemSize = elem
 		field.Size = len(data)
 	}
@@ -349,7 +382,7 @@ func (p *Parser) parseTypeInitializers(lineNo int, decl, initExpr string) ([]byt
 	if p.isAggregateType(decl) {
 		return p.parseAggregateInitializers(lineNo, decl, initExpr)
 	}
-	return p.parseInitializers(lineNo, normalizeDecl(decl), initExpr)
+	return p.parseInitializers(lineNo, p.canonicalTypeName(decl), initExpr)
 }
 
 func (p *Parser) parseAggregateInitializers(lineNo int, typeName, initExpr string) ([]byte, int, error) {
@@ -554,7 +587,7 @@ func (p *Parser) parseAggregateBaseOperand(lineNo int, text string) (vm.Operand,
 			return mem, def, true, nil
 		}
 	}
-	if symbol, ok := p.symbols[strings.ToLower(text)]; ok {
+	if symbol, ok := p.lookupScopedSymbol(text); ok {
 		def, ok := p.aggregates[strings.ToLower(symbol.Decl)]
 		if ok {
 			return vm.Operand{Kind: "mem", Text: symbol.Name, Size: int(symbol.ElemSize)}, def, true, nil
@@ -566,7 +599,7 @@ func (p *Parser) parseAggregateBaseOperand(lineNo int, text string) (vm.Operand,
 			return vm.Operand{}, aggregateDef{}, true, err
 		}
 		if mem.Text != "" {
-			if symbol, ok := p.symbols[strings.ToLower(mem.Text)]; ok {
+			if symbol, ok := p.lookupScopedSymbol(mem.Text); ok {
 				if def, ok := p.aggregates[strings.ToLower(symbol.Decl)]; ok {
 					return mem, def, true, nil
 				}
@@ -687,5 +720,99 @@ func seedBuiltinAggregates(p *Parser) {
 		},
 		Size:    22,
 		Default: make([]byte, 22),
+	})
+	register(aggregateDef{
+		Name: "KEY_EVENT_UCHAR",
+		Kind: "union",
+		Fields: []aggregateField{
+			{Name: "UnicodeChar", Decl: "WORD", Offset: 0, Size: 2, Length: 1, ElemSize: 2, Default: make([]byte, 2)},
+			{Name: "AsciiChar", Decl: "BYTE", Offset: 0, Size: 1, Length: 1, ElemSize: 1, Default: make([]byte, 1)},
+		},
+		Size:    2,
+		Default: make([]byte, 2),
+	})
+	register(aggregateDef{
+		Name: "KEY_EVENT_RECORD",
+		Kind: "struct",
+		Fields: []aggregateField{
+			{Name: "bKeyDown", Decl: "DWORD", Offset: 0, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+			{Name: "wRepeatCount", Decl: "WORD", Offset: 4, Size: 2, Length: 1, ElemSize: 2, Default: make([]byte, 2)},
+			{Name: "wVirtualKeyCode", Decl: "WORD", Offset: 6, Size: 2, Length: 1, ElemSize: 2, Default: make([]byte, 2)},
+			{Name: "wVirtualScanCode", Decl: "WORD", Offset: 8, Size: 2, Length: 1, ElemSize: 2, Default: make([]byte, 2)},
+			{Name: "uChar", Decl: "KEY_EVENT_UCHAR", TypeName: "KEY_EVENT_UCHAR", Offset: 10, Size: 2, Length: 1, ElemSize: 2, Default: make([]byte, 2)},
+			{Name: "dwControlKeyState", Decl: "DWORD", Offset: 12, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+		},
+		Size:    16,
+		Default: make([]byte, 16),
+	})
+	register(aggregateDef{
+		Name: "MOUSE_EVENT_RECORD",
+		Kind: "struct",
+		Fields: []aggregateField{
+			{Name: "dwMousePosition", Decl: "COORD", TypeName: "COORD", Offset: 0, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+			{Name: "dwButtonState", Decl: "DWORD", Offset: 4, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+			{Name: "dwMouseControlKeyState", Decl: "DWORD", Offset: 8, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+			{Name: "dwEventFlags", Decl: "DWORD", Offset: 12, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+		},
+		Size:    16,
+		Default: make([]byte, 16),
+	})
+	register(aggregateDef{
+		Name: "WINDOW_BUFFER_SIZE_RECORD",
+		Kind: "struct",
+		Fields: []aggregateField{
+			{Name: "dwSize", Decl: "COORD", TypeName: "COORD", Offset: 0, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+		},
+		Size:    4,
+		Default: make([]byte, 4),
+	})
+	register(aggregateDef{
+		Name: "MENU_EVENT_RECORD",
+		Kind: "struct",
+		Fields: []aggregateField{
+			{Name: "dwCommandId", Decl: "DWORD", Offset: 0, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+		},
+		Size:    4,
+		Default: make([]byte, 4),
+	})
+	register(aggregateDef{
+		Name: "FOCUS_EVENT_RECORD",
+		Kind: "struct",
+		Fields: []aggregateField{
+			{Name: "bSetFocus", Decl: "DWORD", Offset: 0, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+		},
+		Size:    4,
+		Default: make([]byte, 4),
+	})
+	register(aggregateDef{
+		Name: "INPUT_RECORD_EVENT",
+		Kind: "union",
+		Fields: []aggregateField{
+			{Name: "bKeyDown", Decl: "DWORD", Offset: 0, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+			{Name: "wRepeatCount", Decl: "WORD", Offset: 4, Size: 2, Length: 1, ElemSize: 2, Default: make([]byte, 2)},
+			{Name: "wVirtualKeyCode", Decl: "WORD", Offset: 6, Size: 2, Length: 1, ElemSize: 2, Default: make([]byte, 2)},
+			{Name: "wVirtualScanCode", Decl: "WORD", Offset: 8, Size: 2, Length: 1, ElemSize: 2, Default: make([]byte, 2)},
+			{Name: "uChar", Decl: "KEY_EVENT_UCHAR", TypeName: "KEY_EVENT_UCHAR", Offset: 10, Size: 2, Length: 1, ElemSize: 2, Default: make([]byte, 2)},
+			{Name: "dwControlKeyState", Decl: "DWORD", Offset: 12, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+			{Name: "dwMousePosition", Decl: "COORD", TypeName: "COORD", Offset: 0, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+			{Name: "dwButtonState", Decl: "DWORD", Offset: 4, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+			{Name: "dwMouseControlKeyState", Decl: "DWORD", Offset: 8, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+			{Name: "dwEventFlags", Decl: "DWORD", Offset: 12, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+			{Name: "dwSize", Decl: "COORD", TypeName: "COORD", Offset: 0, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+			{Name: "dwCommandId", Decl: "DWORD", Offset: 0, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+			{Name: "bSetFocus", Decl: "DWORD", Offset: 0, Size: 4, Length: 1, ElemSize: 4, Default: make([]byte, 4)},
+		},
+		Size:    16,
+		Default: make([]byte, 16),
+	})
+	register(aggregateDef{
+		Name: "INPUT_RECORD",
+		Kind: "struct",
+		Fields: []aggregateField{
+			{Name: "EventType", Decl: "WORD", Offset: 0, Size: 2, Length: 1, ElemSize: 2, Default: make([]byte, 2)},
+			{Name: "Event", Decl: "INPUT_RECORD_EVENT", TypeName: "INPUT_RECORD_EVENT", Offset: 4, Size: 16, Length: 1, ElemSize: 16, Default: make([]byte, 16)},
+		},
+		Size:    20,
+		Default: make([]byte, 20),
 	})
 }

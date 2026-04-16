@@ -36,13 +36,89 @@ type exprParser struct {
 }
 
 func (p *exprParser) parseExpression() (int64, error) {
-	value, err := p.parseTerm()
+	return p.parseOr()
+}
+
+func (p *exprParser) parseOr() (int64, error) {
+	value, err := p.parseXor()
+	if err != nil {
+		return 0, err
+	}
+	for p.has("|") || p.hasIdent("or") {
+		p.consume()
+		right, err := p.parseXor()
+		if err != nil {
+			return 0, err
+		}
+		value |= right
+	}
+	return value, nil
+}
+
+func (p *exprParser) parseXor() (int64, error) {
+	value, err := p.parseAnd()
+	if err != nil {
+		return 0, err
+	}
+	for p.has("^") || p.hasIdent("xor") {
+		p.consume()
+		right, err := p.parseAnd()
+		if err != nil {
+			return 0, err
+		}
+		value ^= right
+	}
+	return value, nil
+}
+
+func (p *exprParser) parseAnd() (int64, error) {
+	value, err := p.parseShift()
+	if err != nil {
+		return 0, err
+	}
+	for p.has("&") || p.hasIdent("and") {
+		p.consume()
+		right, err := p.parseShift()
+		if err != nil {
+			return 0, err
+		}
+		value &= right
+	}
+	return value, nil
+}
+
+func (p *exprParser) parseShift() (int64, error) {
+	value, err := p.parseAddSub()
+	if err != nil {
+		return 0, err
+	}
+	for p.hasIdent("shl") || p.hasIdent("shr") {
+		op := strings.ToLower(p.consume().text)
+		right, err := p.parseAddSub()
+		if err != nil {
+			return 0, err
+		}
+		if right < 0 {
+			return 0, fmt.Errorf("line %d: negative shift count", p.lineNo)
+		}
+		switch op {
+		case "shl":
+			value <<= uint(right)
+		case "shr":
+			value = int64(uint64(value) >> uint(right))
+		}
+	}
+	return value, nil
+}
+
+func (p *exprParser) parseAddSub() (int64, error) {
+	value, err := p.parseMulDiv()
 	if err != nil {
 		return 0, err
 	}
 	for p.has("+") || p.has("-") {
 		op := p.consume().text
-		right, err := p.parseTerm()
+		right, err := p.parseMulDiv()
 		if err != nil {
 			return 0, err
 		}
@@ -55,7 +131,7 @@ func (p *exprParser) parseExpression() (int64, error) {
 	return value, nil
 }
 
-func (p *exprParser) parseTerm() (int64, error) {
+func (p *exprParser) parseMulDiv() (int64, error) {
 	value, err := p.parseUnary()
 	if err != nil {
 		return 0, err
@@ -88,6 +164,14 @@ func (p *exprParser) parseUnary() (int64, error) {
 		value, err := p.parseUnary()
 		return -value, err
 	}
+	if p.has("~") || p.hasIdent("not") {
+		p.consume()
+		value, err := p.parseUnary()
+		if err != nil {
+			return 0, err
+		}
+		return ^value, nil
+	}
 	if p.hasIdent("offset") || p.hasIdent("addr") || p.hasIdent("lengthof") || p.hasIdent("length") || p.hasIdent("sizeof") || p.hasIdent("size") || p.hasIdent("type") {
 		op := strings.ToLower(p.consume().text)
 		next := p.consume()
@@ -96,25 +180,25 @@ func (p *exprParser) parseUnary() (int64, error) {
 		}
 		switch op {
 		case "offset", "addr":
-			symbol, ok := p.parser.exprSymbols[strings.ToLower(next.text)]
+			symbol, ok := p.parser.lookupScopedExprSymbol(next.text)
 			if !ok {
 				return 0, fmt.Errorf("line %d: unknown symbol %q", p.lineNo, next.text)
 			}
 			return int64(symbol.Address), nil
 		case "lengthof", "length":
-			symbol, ok := p.parser.exprSymbols[strings.ToLower(next.text)]
+			symbol, ok := p.parser.lookupScopedExprSymbol(next.text)
 			if !ok {
 				return 0, fmt.Errorf("line %d: unknown symbol %q", p.lineNo, next.text)
 			}
 			return int64(symbol.Length), nil
 		case "sizeof", "size":
-			symbol, ok := p.parser.exprSymbols[strings.ToLower(next.text)]
+			symbol, ok := p.parser.lookupScopedExprSymbol(next.text)
 			if !ok {
 				return 0, fmt.Errorf("line %d: unknown symbol %q", p.lineNo, next.text)
 			}
 			return int64(symbol.Size), nil
 		case "type":
-			if symbol, ok := p.parser.exprSymbols[strings.ToLower(next.text)]; ok {
+			if symbol, ok := p.parser.lookupScopedExprSymbol(next.text); ok {
 				return int64(symbol.ElemSize), nil
 			}
 			if size := p.parser.typeSize(next.text); size != 0 {
@@ -159,7 +243,7 @@ func (p *exprParser) parsePrimary() (int64, error) {
 		if value, ok := p.parser.constants[lower]; ok {
 			return value, nil
 		}
-		if symbol, ok := p.parser.exprSymbols[lower]; ok {
+		if symbol, ok := p.parser.lookupScopedExprSymbol(token.text); ok {
 			return int64(symbol.Address), nil
 		}
 		return 0, fmt.Errorf("line %d: unknown identifier %q", p.lineNo, token.text)
@@ -177,6 +261,9 @@ func (p *exprParser) hasIdent(text string) bool {
 }
 
 func (p *exprParser) consume() exprToken {
+	if p.pos >= len(p.tokens) {
+		return exprToken{}
+	}
 	token := p.tokens[p.pos]
 	p.pos++
 	return token
@@ -188,7 +275,7 @@ func tokenizeExpr(expr string) ([]exprToken, error) {
 		switch ch := expr[i]; {
 		case unicode.IsSpace(rune(ch)):
 			i++
-		case ch == '(' || ch == ')' || ch == '+' || ch == '-' || ch == '*' || ch == '/':
+		case ch == '(' || ch == ')' || ch == '+' || ch == '-' || ch == '*' || ch == '/' || ch == '&' || ch == '|' || ch == '^' || ch == '~':
 			tokens = append(tokens, exprToken{kind: "op", text: string(ch)})
 			i++
 		case ch == '$':

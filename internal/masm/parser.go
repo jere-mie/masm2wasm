@@ -14,67 +14,133 @@ import (
 var (
 	reProc      = regexp.MustCompile(`(?i)^([A-Za-z_@$?.][\w@$?.]*)\s+PROC\b`)
 	reEndp      = regexp.MustCompile(`(?i)^([A-Za-z_@$?.][\w@$?.]*)\s+ENDP\b`)
-	reData      = regexp.MustCompile(`(?i)^(?:(\w+)\s+)?(BYTE|WORD|DWORD|SDWORD|HANDLE|QWORD|REAL4|REAL8|REAL10|DB|DW|DD|DQ|DT|TBYTE)\s*(.*)$`)
+	reData      = regexp.MustCompile(`(?i)^(?:(\w+)\s+)?(BYTE|SBYTE|WORD|SWORD|DWORD|SDWORD|HANDLE|QWORD|REAL4|REAL8|REAL10|DB|DW|DD|DQ|DT|TBYTE)\s*(.*)$`)
 	reConstEq   = regexp.MustCompile(`(?i)^([A-Za-z_@$?.][\w@$?.]*)\s*=\s*(.+)$`)
 	reConstEqu  = regexp.MustCompile(`(?i)^([A-Za-z_@$?.][\w@$?.]*)\s+EQU\s+(.+)$`)
 	reDup       = regexp.MustCompile(`(?i)^(.*?)\s+DUP\s*\((.*)\)$`)
 	reProtoLike = regexp.MustCompile(`(?i)^[A-Za-z_@$?.][\w@$?.]*\s+PROTO\b`)
 	reMacro     = regexp.MustCompile(`(?i)^([A-Za-z_@$?.][\w@$?.]*)\s+MACRO\b(.*)$`)
 	reTextEqu   = regexp.MustCompile(`(?i)^([A-Za-z_@$?.][\w@$?.]*)\s+TEXTEQU\s+(.+)$`)
+	reTypeDef   = regexp.MustCompile(`(?i)^([A-Za-z_@$?.][\w@$?.]*)\s+TYPEDEF\s+(.+)$`)
 )
 
 var builtinConstants = map[string]int64{
-	"do_not_share":          0,
-	"null":                  0,
-	"file_attribute_normal": 0x80,
-	"generic_read":          0x80000000,
-	"generic_write":         0x40000000,
-	"create_always":         2,
-	"open_existing":         3,
-	"std_input_handle":      -10,
-	"std_output_handle":     -11,
-	"std_error_handle":      -12,
-	"invalid_handle_value":  -1,
-	"heap_zero_memory":      0x00000008,
-	"vk_numlock":            0x90,
-	"vk_scroll":             0x91,
-	"vk_lshift":             0xA0,
-	"vk_rshift":             0xA1,
-	"vk_lcontrol":           0xA2,
-	"vk_rcontrol":           0xA3,
-	"vk_lmenu":              0xA4,
-	"vk_rmenu":              0xA5,
-	"key_event":             1,
-	"right_alt_pressed":     0x0001,
-	"left_alt_pressed":      0x0002,
-	"right_ctrl_pressed":    0x0004,
-	"left_ctrl_pressed":     0x0008,
-	"shift_pressed":         0x0010,
-	"numlock_on":            0x0020,
-	"scrolllock_on":         0x0040,
-	"capslock_on":           0x80,
-	"black":                 0x0,
-	"blue":                  0x1,
-	"green":                 0x2,
-	"cyan":                  0x3,
-	"red":                   0x4,
-	"magenta":               0x5,
-	"brown":                 0x6,
-	"lightgray":             0x7,
-	"gray":                  0x8,
-	"lightblue":             0x9,
-	"lightgreen":            0xA,
-	"lightcyan":             0xB,
-	"lightred":              0xC,
-	"lightmagenta":          0xD,
-	"yellow":                0xE,
-	"white":                 0xF,
-	"@version":              600,
+	"do_not_share":                   0,
+	"null":                           0,
+	"false":                          0,
+	"true":                           1,
+	"file_attribute_normal":          0x80,
+	"generic_read":                   0x80000000,
+	"generic_write":                  0x40000000,
+	"create_always":                  2,
+	"open_existing":                  3,
+	"file_begin":                     0,
+	"file_current":                   1,
+	"file_end":                       2,
+	"std_input_handle":               -10,
+	"std_output_handle":              -11,
+	"std_error_handle":               -12,
+	"invalid_handle_value":           -1,
+	"heap_zero_memory":               0x00000008,
+	"vk_numlock":                     0x90,
+	"vk_scroll":                      0x91,
+	"vk_shift":                       0x10,
+	"vk_tab":                         0x09,
+	"vk_control":                     0x11,
+	"vk_menu":                        0x12,
+	"vk_11":                          0x0C,
+	"vk_12":                          0x0D,
+	"vk_capital":                     0x14,
+	"vk_prior":                       0x21,
+	"vk_next":                        0x22,
+	"vk_end":                         0x23,
+	"vk_home":                        0x24,
+	"vk_left":                        0x25,
+	"vk_up":                          0x26,
+	"vk_right":                       0x27,
+	"vk_down":                        0x28,
+	"vk_insert":                      0x2D,
+	"vk_delete":                      0x2E,
+	"vk_f1":                          0x70,
+	"vk_f10":                         0x79,
+	"vk_f11":                         0x7A,
+	"vk_f12":                         0x7B,
+	"vk_add":                         0x6B,
+	"vk_subtract":                    0x6D,
+	"vk_lshift":                      0xA0,
+	"vk_rshift":                      0xA1,
+	"vk_lcontrol":                    0xA2,
+	"vk_rcontrol":                    0xA3,
+	"vk_lmenu":                       0xA4,
+	"vk_rmenu":                       0xA5,
+	"key_event":                      1,
+	"right_alt_pressed":              0x0001,
+	"left_alt_pressed":               0x0002,
+	"right_ctrl_pressed":             0x0004,
+	"left_ctrl_pressed":              0x0008,
+	"shift_pressed":                  0x0010,
+	"numlock_on":                     0x0020,
+	"scrolllock_on":                  0x0040,
+	"capslock_on":                    0x80,
+	"black":                          0x0,
+	"blue":                           0x1,
+	"green":                          0x2,
+	"cyan":                           0x3,
+	"red":                            0x4,
+	"magenta":                        0x5,
+	"brown":                          0x6,
+	"lightgray":                      0x7,
+	"gray":                           0x8,
+	"lightblue":                      0x9,
+	"lightgreen":                     0xA,
+	"lightcyan":                      0xB,
+	"lightred":                       0xC,
+	"lightmagenta":                   0xD,
+	"yellow":                         0xE,
+	"white":                          0xF,
+	"mb_ok":                          0,
+	"mb_okcancel":                    1,
+	"mb_abortretryignore":            2,
+	"mb_yesnocancel":                 3,
+	"mb_yesno":                       4,
+	"mb_retrycancel":                 5,
+	"mb_canceltrycontinue":           6,
+	"mb_defbutton1":                  0x0000,
+	"mb_defbutton2":                  0x0100,
+	"mb_defbutton3":                  0x0200,
+	"mb_defbutton4":                  0x0300,
+	"mb_iconhand":                    0x0010,
+	"mb_iconstop":                    0x0010,
+	"mb_iconquestion":                0x0020,
+	"mb_iconexclamation":             0x0030,
+	"mb_iconwarning":                 0x0030,
+	"mb_iconasterisk":                0x0040,
+	"mb_iconinformation":             0x0040,
+	"idok":                           1,
+	"idcancel":                       2,
+	"idabort":                        3,
+	"idretry":                        4,
+	"idignore":                       5,
+	"idyes":                          6,
+	"idno":                           7,
+	"idclose":                        8,
+	"idhelp":                         9,
+	"idtryagain":                     10,
+	"idcontinue":                     11,
+	"format_message_allocate_buffer": 0x0100,
+	"format_message_from_system":     0x1000,
+	"@version":                       600,
 }
 
 type sourceLine struct {
 	Number int
 	Text   string
+}
+
+type procFixup struct {
+	Name   string
+	Offset uint32
+	Size   int
 }
 
 type ifFrame struct {
@@ -110,6 +176,7 @@ type Parser struct {
 	exprSymbols    map[string]vm.Symbol
 	constants      map[string]int64
 	textConstants  map[string]string
+	typeAliases    map[string]string
 	procSigs       map[string]procSignature
 	aggregates     map[string]aggregateDef
 	aggregateStack []aggregateBuilder
@@ -122,6 +189,7 @@ type Parser struct {
 	ifStack        []ifFrame
 	whileStack     []whileFrame
 	repeatStack    []repeatFrame
+	procFixups     []procFixup
 }
 
 func Parse(source string) (*vm.Program, error) {
@@ -135,9 +203,12 @@ func Parse(source string) (*vm.Program, error) {
 		exprSymbols:   map[string]vm.Symbol{},
 		constants:     map[string]int64{},
 		textConstants: map[string]string{},
+		typeAliases:   map[string]string{},
 		procSigs:      map[string]procSignature{},
 		aggregates:    map[string]aggregateDef{},
 		lastDataIndex: -1,
+		currentOffset: 4,
+		program:       vm.Program{Data: make([]byte, 4)},
 	}
 	for k, v := range builtinConstants {
 		p.constants[k] = v
@@ -146,10 +217,39 @@ func Parse(source string) (*vm.Program, error) {
 	if err := p.parse(); err != nil {
 		return nil, err
 	}
+	if err := p.finalizeProcedureRefs(); err != nil {
+		return nil, err
+	}
 	if err := p.program.Validate(); err != nil {
 		return nil, err
 	}
 	return &p.program, nil
+}
+
+func (p *Parser) makeScopedSymbolName(name string) string {
+	if p.currentProc == nil {
+		return name
+	}
+	return fmt.Sprintf("%s$%s", p.currentProc.Name, name)
+}
+
+func (p *Parser) lookupScopedSymbol(name string) (vm.Symbol, bool) {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	if p.currentCtx != nil {
+		if symbol, ok := p.currentCtx.localSymbols[lower]; ok {
+			return symbol, true
+		}
+	}
+	symbol, ok := p.symbols[lower]
+	return symbol, ok
+}
+
+func (p *Parser) lookupScopedExprSymbol(name string) (vm.Symbol, bool) {
+	if symbol, ok := p.lookupScopedSymbol(name); ok {
+		return symbol, true
+	}
+	symbol, ok := p.exprSymbols[strings.ToLower(strings.TrimSpace(name))]
+	return symbol, ok
 }
 
 func preprocess(source string) ([]sourceLine, error) {
@@ -182,9 +282,10 @@ func preprocess(source string) ([]sourceLine, error) {
 		} else {
 			pending.WriteByte(' ')
 		}
+		continued := continuesLine(line)
 		line = strings.TrimSpace(strings.TrimSuffix(line, `\`))
 		pending.WriteString(line)
-		if continuesLine(line) {
+		if continued {
 			continue
 		}
 		lines = append(lines, sourceLine{Number: pendingLine, Text: pending.String()})
@@ -456,6 +557,7 @@ func replaceMacroIdentifiers(text string, replacements map[string]string) string
 }
 
 func (p *Parser) parse() error {
+parseLoop:
 	for _, src := range p.lines {
 		line := strings.TrimSpace(src.Text)
 		if line == "" {
@@ -487,9 +589,11 @@ func (p *Parser) parse() error {
 			continue
 		case lower == ".nolist" || lower == ".list":
 			continue
-		case lower == ".386" || lower == ".386p" || lower == ".486" || lower == ".486p" || lower == ".586" || lower == ".586p":
+		case lower == ".386" || lower == ".386p" || lower == ".486" || lower == ".486p" || lower == ".586" || lower == ".586p" || lower == ".686" || lower == ".686p":
 			continue
-		case strings.HasPrefix(lower, ".model ") || strings.HasPrefix(lower, ".stack"):
+		case lower == ".mmx" || lower == ".xmm":
+			continue
+		case strings.HasPrefix(lower, ".model") || strings.HasPrefix(lower, ".stack"):
 			continue
 		case lower == ".startup" || strings.HasPrefix(lower, ".exit"):
 			continue
@@ -502,14 +606,21 @@ func (p *Parser) parse() error {
 		case lower == ".code":
 			p.section = "code"
 			continue
+		case lower == "end":
+			break parseLoop
 		case strings.HasPrefix(lower, "end "):
 			fields := strings.Fields(line)
 			if len(fields) > 1 {
 				p.program.Entry = fields[1]
 			}
-			continue
+			break parseLoop
 		case reProtoLike.MatchString(line):
 			if err := p.parseProtoLine(src.Number, line); err != nil {
+				return err
+			}
+			continue
+		case reTypeDef.MatchString(line):
+			if err := p.parseTypeDefLine(src.Number, line); err != nil {
 				return err
 			}
 			continue
@@ -609,6 +720,10 @@ func (p *Parser) parseDataLine(lineNo int, line string) error {
 			ElemSize: uint32(elemSize),
 			Decl:     decl,
 		}
+		if p.currentCtx != nil {
+			symbol.Name = p.makeScopedSymbolName(name)
+			p.currentCtx.localSymbols[strings.ToLower(name)] = symbol
+		}
 		p.addRuntimeSymbol(symbol)
 		p.lastDataIndex = len(p.program.Symbols) - 1
 		p.currentOffset = int64(len(p.program.Data))
@@ -625,9 +740,9 @@ func (p *Parser) parseDataLine(lineNo int, line string) error {
 	} else {
 		var ok bool
 		name, decl, initExpr, ok = parseDeclTokens(line)
-		if !ok || !isIdentifier(name) || !p.isAggregateType(decl) {
+		if !ok || !isIdentifier(name) || (p.typeSize(decl) == 0 && !p.isAggregateType(decl)) {
 			first, rest := splitOpcode(line)
-			if p.isAggregateType(first) && strings.TrimSpace(rest) != "" {
+			if (p.isAggregateType(first) || p.typeSize(first) != 0) && strings.TrimSpace(rest) != "" {
 				name = ""
 				decl = first
 				initExpr = rest
@@ -675,6 +790,11 @@ func (p *Parser) parseDataLine(lineNo int, line string) error {
 		Length:   uint32(items),
 		ElemSize: uint32(elemSize),
 		Decl:     decl,
+	}
+	if p.currentCtx != nil {
+		scopedName := p.makeScopedSymbolName(name)
+		symbol.Name = scopedName
+		p.currentCtx.localSymbols[strings.ToLower(name)] = symbol
 	}
 	p.program.Data = append(p.program.Data, data...)
 	baseIndex := len(p.program.Symbols)
@@ -767,6 +887,14 @@ func (p *Parser) initBytes(lineNo int, decl, token string) ([]byte, int, error) 
 
 	value, err := p.evalExpr(lineNo, token)
 	if err != nil {
+		if elemSize == 4 && isIdentifier(strings.TrimSpace(token)) {
+			p.procFixups = append(p.procFixups, procFixup{
+				Name:   strings.TrimSpace(token),
+				Offset: uint32(p.currentOffset),
+				Size:   elemSize,
+			})
+			return make([]byte, elemSize), 1, nil
+		}
 		return nil, 0, err
 	}
 	buf := make([]byte, elemSize)
@@ -783,6 +911,31 @@ func (p *Parser) initBytes(lineNo int, decl, token string) ([]byte, int, error) 
 		return nil, 0, fmt.Errorf("line %d: unsupported element width %d", lineNo, elemSize)
 	}
 	return buf, 1, nil
+}
+
+func (p *Parser) finalizeProcedureRefs() error {
+	procAddrs := map[string]uint32{}
+	for i := range p.program.Procedures {
+		addr := uint32(0x70000000 + i*4)
+		p.program.Procedures[i].Address = addr
+		procAddrs[strings.ToLower(p.program.Procedures[i].Name)] = addr
+	}
+	for _, fixup := range p.procFixups {
+		addr, ok := procAddrs[strings.ToLower(fixup.Name)]
+		if !ok {
+			return fmt.Errorf("unknown procedure %q referenced in data", fixup.Name)
+		}
+		if int(fixup.Offset)+fixup.Size > len(p.program.Data) {
+			return fmt.Errorf("procedure fixup for %q is out of range", fixup.Name)
+		}
+		switch fixup.Size {
+		case 4:
+			binary.LittleEndian.PutUint32(p.program.Data[fixup.Offset:], addr)
+		default:
+			return fmt.Errorf("unsupported procedure fixup size %d for %q", fixup.Size, fixup.Name)
+		}
+	}
+	return nil
 }
 
 func (p *Parser) parseCodeLine(lineNo int, line string) error {
@@ -829,6 +982,8 @@ func (p *Parser) parseCodeLine(lineNo int, line string) error {
 
 	op, rest := splitOpcode(line)
 	switch strings.ToLower(op) {
+	case "startup":
+		return nil
 	case "mwrite":
 		return p.parseMWrite(lineNo, line, rest, false)
 	case "mwriteln":
@@ -985,6 +1140,18 @@ func (p *Parser) parseInvoke(lineNo int, source, rest string) error {
 		p.addInst(lineNo, source, "exit", args...)
 		return nil
 	}
+	if isDirectInvokeBuiltinTarget(target) {
+		args := []vm.Operand{{Kind: "name", Text: target}}
+		for _, part := range parts[1:] {
+			op, err := p.parseOperand(lineNo, "invoke", strings.TrimSpace(part))
+			if err != nil {
+				return err
+			}
+			args = append(args, op)
+		}
+		p.addInst(lineNo, source, "invoke", args...)
+		return nil
+	}
 	if sig, ok := p.procSigs[strings.ToLower(target)]; ok && len(parts) > 1 {
 		args := make([]vm.Operand, 0, len(parts)-1)
 		for _, part := range parts[1:] {
@@ -1013,6 +1180,15 @@ func (p *Parser) parseInvoke(lineNo int, source, rest string) error {
 	}
 	p.addInst(lineNo, source, "invoke", args...)
 	return nil
+}
+
+func isDirectInvokeBuiltinTarget(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "printf", "scanf", "system", "fopen", "fclose", "setconsoleoutputcp", "getconsoleoutputcp", "setconsolecp", "getconsolecp":
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Parser) parseMWrite(lineNo int, source, rest string, addNewline bool) error {
@@ -1156,11 +1332,28 @@ func (p *Parser) parseOperand(lineNo int, opcode, text string) (vm.Operand, erro
 	}
 
 	if strings.HasPrefix(lower, "offset ") || strings.HasPrefix(lower, "addr ") {
-		name := strings.TrimSpace(text[strings.Index(text, " ")+1:])
-		if op, ok := p.lookupProcAlias(name); ok {
+		ref := strings.TrimSpace(text[strings.Index(text, " ")+1:])
+		if op, ok := p.lookupProcAlias(ref); ok {
 			if strings.HasPrefix(lower, "addr ") {
 				return op, nil
 			}
+		}
+		if mem, ok, err := p.parseMemoryOperand(lineNo, ref, 0); ok || err != nil {
+			if err != nil {
+				return vm.Operand{}, err
+			}
+			if mem.Base != "" || mem.Index != "" {
+				return vm.Operand{}, fmt.Errorf("line %d: %s requires a direct memory address", lineNo, strings.Fields(lower)[0])
+			}
+			addr := mem.Offset
+			if mem.Text != "" {
+				symbol, ok := p.lookupScopedSymbol(mem.Text)
+				if !ok {
+					return vm.Operand{}, fmt.Errorf("line %d: unknown symbol %q", lineNo, mem.Text)
+				}
+				addr += int64(symbol.Address)
+			}
+			return vm.Operand{Kind: "imm", Text: text, Value: addr}, nil
 		}
 		value, err := p.evalExpr(lineNo, text)
 		if err != nil {
@@ -1183,7 +1376,7 @@ func (p *Parser) parseOperand(lineNo int, opcode, text string) (vm.Operand, erro
 	if isRegister(lower) {
 		return vm.Operand{Kind: "reg", Text: lower}, nil
 	}
-	if symbol, ok := p.symbols[strings.ToLower(text)]; ok {
+	if symbol, ok := p.lookupScopedSymbol(text); ok {
 		return vm.Operand{Kind: "symbol", Text: symbol.Name, Size: int(symbol.ElemSize)}, nil
 	}
 	if value, err := p.evalExpr(lineNo, text); err == nil {
@@ -1212,7 +1405,7 @@ func (p *Parser) parseMemoryOperand(lineNo int, text string, explicitSize int) (
 
 	op := vm.Operand{Kind: "mem", Size: explicitSize}
 	if prefix != "" {
-		if symbol, ok := p.symbols[strings.ToLower(prefix)]; ok {
+		if symbol, ok := p.lookupScopedSymbol(prefix); ok {
 			op.Text = symbol.Name
 			if op.Size == 0 {
 				op.Size = int(symbol.ElemSize)
@@ -1263,7 +1456,7 @@ func (p *Parser) parseMemoryOperand(lineNo int, text string, explicitSize int) (
 			}
 			continue
 		}
-		if symbol, ok := p.symbols[lower]; ok {
+		if symbol, ok := p.lookupScopedSymbol(value); ok {
 			if op.Text == "" {
 				op.Text = symbol.Name
 				if op.Size == 0 {
@@ -1284,6 +1477,20 @@ func (p *Parser) parseMemoryOperand(lineNo int, text string, explicitSize int) (
 		return vm.Operand{}, true, fmt.Errorf("line %d: unsupported memory operand %q", lineNo, original)
 	}
 	return op, true, nil
+}
+
+func (p *Parser) parseTypeDefLine(lineNo int, line string) error {
+	match := reTypeDef.FindStringSubmatch(strings.TrimSpace(line))
+	if match == nil {
+		return fmt.Errorf("line %d: invalid TYPEDEF %q", lineNo, line)
+	}
+	alias := strings.TrimSpace(match[1])
+	typeSpec := strings.TrimSpace(match[2])
+	if !isIdentifier(alias) || typeSpec == "" {
+		return fmt.Errorf("line %d: invalid TYPEDEF %q", lineNo, line)
+	}
+	p.typeAliases[strings.ToLower(alias)] = typeSpec
+	return nil
 }
 
 func (p *Parser) addInst(lineNo int, source, op string, args ...vm.Operand) {
@@ -1495,6 +1702,10 @@ func parseStringLiteral(token string) (string, error) {
 
 func normalizeDecl(name string) string {
 	switch strings.ToUpper(name) {
+	case "SBYTE":
+		return "BYTE"
+	case "SWORD":
+		return "WORD"
 	case "HANDLE":
 		return "DWORD"
 	case "DB":

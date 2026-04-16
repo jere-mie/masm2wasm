@@ -24,6 +24,7 @@ type Symbol struct {
 
 type Procedure struct {
 	Name         string         `json:"name"`
+	Address      uint32         `json:"address,omitempty"`
 	Labels       map[string]int `json:"labels"`
 	Instructions []Instruction  `json:"instructions"`
 }

@@ -25,6 +25,7 @@ type procSignature struct {
 type procContext struct {
 	sig             procSignature
 	aliases         map[string]vm.Operand
+	localSymbols    map[string]vm.Symbol
 	localBytes      int
 	localPatchIndex int
 	frameStarted    bool
@@ -56,6 +57,7 @@ func (p *Parser) beginProc(lineNo int, line string) error {
 	p.currentCtx = &procContext{
 		sig:             sig,
 		aliases:         map[string]vm.Operand{},
+		localSymbols:    map[string]vm.Symbol{},
 		localPatchIndex: -1,
 	}
 	p.procSigs[strings.ToLower(name)] = sig
@@ -206,7 +208,7 @@ func parseProcSignature(lineNo int, line, keyword string) (string, procSignature
 		case lower == "":
 		case !paramMode && lower == "uses":
 			inUses = true
-		case !paramMode && keyword == "proc" && (lower == "near" || lower == "near32" || lower == "far"):
+		case !paramMode && keyword == "proc" && (lower == "near" || lower == "near32" || lower == "far" || lower == "private" || lower == "public"):
 			continue
 		case !paramMode && isCallingConvention(lower):
 			sig.Convention = lower
