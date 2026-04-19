@@ -500,6 +500,94 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 		return false, m.execXLAT(inst)
 	case "cdq":
 		return false, m.execCDQ()
+	case "cmova", "cmovnbe":
+		return false, m.execCmov(inst, !m.cf && !m.zf)
+	case "cmovae", "cmovnb", "cmovnc":
+		return false, m.execCmov(inst, !m.cf)
+	case "cmovb", "cmovc", "cmovnae":
+		return false, m.execCmov(inst, m.cf)
+	case "cmovbe", "cmovna":
+		return false, m.execCmov(inst, m.cf || m.zf)
+	case "cmove", "cmovz":
+		return false, m.execCmov(inst, m.zf)
+	case "cmovg", "cmovnle":
+		return false, m.execCmov(inst, !m.zf && (m.sf == m.of))
+	case "cmovge", "cmovnl":
+		return false, m.execCmov(inst, m.sf == m.of)
+	case "cmovl", "cmovnge":
+		return false, m.execCmov(inst, m.sf != m.of)
+	case "cmovle", "cmovng":
+		return false, m.execCmov(inst, m.zf || (m.sf != m.of))
+	case "cmovne", "cmovnz":
+		return false, m.execCmov(inst, !m.zf)
+	case "cmovns":
+		return false, m.execCmov(inst, !m.sf)
+	case "cmovno":
+		return false, m.execCmov(inst, !m.of)
+	case "cmovnp", "cmovpo":
+		return false, m.execCmov(inst, !m.pf)
+	case "cmovo":
+		return false, m.execCmov(inst, m.of)
+	case "cmovp", "cmovpe":
+		return false, m.execCmov(inst, m.pf)
+	case "cmovs":
+		return false, m.execCmov(inst, m.sf)
+	case "seta", "setnbe":
+		return false, m.execSetcc(inst, !m.cf && !m.zf)
+	case "setae", "setnb", "setnc":
+		return false, m.execSetcc(inst, !m.cf)
+	case "setb", "setc", "setnae":
+		return false, m.execSetcc(inst, m.cf)
+	case "setbe", "setna":
+		return false, m.execSetcc(inst, m.cf || m.zf)
+	case "sete", "setz":
+		return false, m.execSetcc(inst, m.zf)
+	case "setg", "setnle":
+		return false, m.execSetcc(inst, !m.zf && (m.sf == m.of))
+	case "setge", "setnl":
+		return false, m.execSetcc(inst, m.sf == m.of)
+	case "setl", "setnge":
+		return false, m.execSetcc(inst, m.sf != m.of)
+	case "setle", "setng":
+		return false, m.execSetcc(inst, m.zf || (m.sf != m.of))
+	case "setne", "setnz":
+		return false, m.execSetcc(inst, !m.zf)
+	case "setns":
+		return false, m.execSetcc(inst, !m.sf)
+	case "setno":
+		return false, m.execSetcc(inst, !m.of)
+	case "setnp", "setpo":
+		return false, m.execSetcc(inst, !m.pf)
+	case "seto":
+		return false, m.execSetcc(inst, m.of)
+	case "setp", "setpe":
+		return false, m.execSetcc(inst, m.pf)
+	case "sets":
+		return false, m.execSetcc(inst, m.sf)
+	case "bt":
+		return false, m.execBitTest(inst, "bt")
+	case "bts":
+		return false, m.execBitTest(inst, "bts")
+	case "btr":
+		return false, m.execBitTest(inst, "btr")
+	case "btc":
+		return false, m.execBitTest(inst, "btc")
+	case "bsf":
+		return false, m.execBSF(inst)
+	case "bsr":
+		return false, m.execBSR(inst)
+	case "bswap":
+		return false, m.execBSWAP(inst)
+	case "xadd":
+		return false, m.execXADD(inst)
+	case "cmpxchg":
+		return false, m.execCMPXCHG(inst)
+	case "aad":
+		return false, m.execAAD(inst)
+	case "aam":
+		return false, m.execAAM(inst)
+	case "lahf":
+		return false, m.execLAHF()
 	case "nop":
 		return false, nil
 	case "jmp":
@@ -1962,6 +2050,225 @@ func (m *Machine) execCDQ() error {
 	} else {
 		m.regs[regEDX] = 0
 	}
+	return nil
+}
+
+func (m *Machine) execCmov(inst Instruction, cond bool) error {
+	if !cond {
+		return nil
+	}
+	return m.execMov(inst)
+}
+
+func (m *Machine) execSetcc(inst Instruction, cond bool) error {
+	if len(inst.Args) != 1 {
+		return fmt.Errorf("%s expects one operand", inst.Op)
+	}
+	var val uint32
+	if cond {
+		val = 1
+	}
+	return m.assign(inst.Args[0], val, 1)
+}
+
+func (m *Machine) execBitTest(inst Instruction, op string) error {
+	if len(inst.Args) != 2 {
+		return fmt.Errorf("%s expects two operands", op)
+	}
+	width, err := m.operandWidth(inst.Args[0], inst.Args[1], 4)
+	if err != nil {
+		return err
+	}
+	dest, _, err := m.resolveValue(inst.Args[0], width)
+	if err != nil {
+		return err
+	}
+	bitIdx, _, err := m.resolveValue(inst.Args[1], width)
+	if err != nil {
+		return err
+	}
+	bitIdx %= uint32(width * 8)
+	m.cf = (dest>>bitIdx)&1 != 0
+	switch op {
+	case "bts":
+		dest |= 1 << bitIdx
+	case "btr":
+		dest &^= 1 << bitIdx
+	case "btc":
+		dest ^= 1 << bitIdx
+	}
+	if op != "bt" {
+		return m.assign(inst.Args[0], dest, width)
+	}
+	return nil
+}
+
+func (m *Machine) execBSF(inst Instruction) error {
+	if len(inst.Args) != 2 {
+		return fmt.Errorf("bsf expects two operands")
+	}
+	width, err := m.operandWidth(inst.Args[0], inst.Args[1], 4)
+	if err != nil {
+		return err
+	}
+	src, _, err := m.resolveValue(inst.Args[1], width)
+	if err != nil {
+		return err
+	}
+	src = truncate(src, width)
+	if src == 0 {
+		m.zf = true
+		return nil
+	}
+	m.zf = false
+	pos := uint32(bits.TrailingZeros32(src))
+	return m.assign(inst.Args[0], pos, width)
+}
+
+func (m *Machine) execBSR(inst Instruction) error {
+	if len(inst.Args) != 2 {
+		return fmt.Errorf("bsr expects two operands")
+	}
+	width, err := m.operandWidth(inst.Args[0], inst.Args[1], 4)
+	if err != nil {
+		return err
+	}
+	src, _, err := m.resolveValue(inst.Args[1], width)
+	if err != nil {
+		return err
+	}
+	src = truncate(src, width)
+	if src == 0 {
+		m.zf = true
+		return nil
+	}
+	m.zf = false
+	pos := uint32(31 - bits.LeadingZeros32(src))
+	return m.assign(inst.Args[0], pos, width)
+}
+
+func (m *Machine) execBSWAP(inst Instruction) error {
+	if len(inst.Args) != 1 {
+		return fmt.Errorf("bswap expects one operand")
+	}
+	val, _, err := m.resolveValue(inst.Args[0], 4)
+	if err != nil {
+		return err
+	}
+	val = bits.ReverseBytes32(val)
+	return m.assign(inst.Args[0], val, 4)
+}
+
+func (m *Machine) execXADD(inst Instruction) error {
+	if len(inst.Args) != 2 {
+		return fmt.Errorf("xadd expects two operands")
+	}
+	width, err := m.operandWidth(inst.Args[0], inst.Args[1], 4)
+	if err != nil {
+		return err
+	}
+	dest, _, err := m.resolveValue(inst.Args[0], width)
+	if err != nil {
+		return err
+	}
+	src, _, err := m.resolveValue(inst.Args[1], width)
+	if err != nil {
+		return err
+	}
+	sum := truncate(dest+src, width)
+	if err := m.assign(inst.Args[1], dest, width); err != nil {
+		return err
+	}
+	m.updateAddFlags(dest, src, sum, width)
+	return m.assign(inst.Args[0], sum, width)
+}
+
+func (m *Machine) execCMPXCHG(inst Instruction) error {
+	if len(inst.Args) != 2 {
+		return fmt.Errorf("cmpxchg expects two operands")
+	}
+	width, err := m.operandWidth(inst.Args[0], inst.Args[1], 4)
+	if err != nil {
+		return err
+	}
+	dest, _, err := m.resolveValue(inst.Args[0], width)
+	if err != nil {
+		return err
+	}
+	src, _, err := m.resolveValue(inst.Args[1], width)
+	if err != nil {
+		return err
+	}
+	acc := m.readAccumulator(width)
+	result := truncate(acc-dest, width)
+	m.updateSubFlags(acc, dest, result, width)
+	if m.zf {
+		return m.assign(inst.Args[0], src, width)
+	}
+	m.writeAccumulator(width, dest)
+	return nil
+}
+
+func (m *Machine) execAAD(inst Instruction) error {
+	base := uint32(10)
+	if len(inst.Args) >= 1 {
+		v, _, err := m.resolveValue(inst.Args[0], 1)
+		if err != nil {
+			return err
+		}
+		base = v
+	}
+	ah := m.readRegister("ah")
+	al := m.readRegister("al")
+	result := byte((ah*base + al) & 0xFF)
+	m.writeRegister("al", uint32(result))
+	m.writeRegister("ah", 0)
+	m.zf = result == 0
+	m.sf = result&0x80 != 0
+	m.pf = parity8(result)
+	return nil
+}
+
+func (m *Machine) execAAM(inst Instruction) error {
+	base := uint32(10)
+	if len(inst.Args) >= 1 {
+		v, _, err := m.resolveValue(inst.Args[0], 1)
+		if err != nil {
+			return err
+		}
+		base = v
+	}
+	if base == 0 {
+		return fmt.Errorf("aam: division by zero")
+	}
+	al := m.readRegister("al")
+	m.writeRegister("ah", (al/base)&0xFF)
+	result := byte(al % base)
+	m.writeRegister("al", uint32(result))
+	m.zf = result == 0
+	m.sf = result&0x80 != 0
+	m.pf = parity8(result)
+	return nil
+}
+
+func (m *Machine) execLAHF() error {
+	var ah byte
+	if m.sf {
+		ah |= 1 << 7
+	}
+	if m.zf {
+		ah |= 1 << 6
+	}
+	if m.af {
+		ah |= 1 << 4
+	}
+	if m.pf {
+		ah |= 1 << 2
+	}
+	if m.cf {
+		ah |= 1 << 0
+	}
+	m.writeRegister("ah", uint32(ah))
 	return nil
 }
 
