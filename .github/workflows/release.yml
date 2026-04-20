@@ -66,6 +66,9 @@ jobs:
           - goos: darwin
             goarch: arm64
             ext: ""
+          - goos: wasip1
+            goarch: wasm
+            ext: .wasm
     steps:
       - name: Check out repository
         uses: actions/checkout@v5

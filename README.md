@@ -51,7 +51,8 @@ This project is now aimed at **real Irvine-style student console programs**, not
 - `push`, `pop`
 - `pushad`, `popad`, `pusha`, `popa`, `pushfd`, `popfd`, `pushf`, `popf`, `leave`, `enter`
 - `cld`, `std`, `clc`, `stc`, `cmc`
-- `aaa`, `aas`, `daa`, `das`
+- `aaa`, `aas`, `daa`, `das`, `aad`, `aam`
+- `lahf`, `sahf`
 - `lodsb`, `lodsw`, `lodsd`
 - `stosb`, `stosw`, `stosd`
 - `movsb`, `movsw`, `movsd`
@@ -59,13 +60,25 @@ This project is now aimed at **real Irvine-style student console programs**, not
 - `scasb`, `scasw`, `scasd`
 - `xlat`
 - `rep`, `repe` / `repz`, `repne` / `repnz` on supported string instructions
+- `cmovcc` (all 16 condition codes: `cmova`, `cmovae`, `cmovb`, `cmovbe`, `cmovc`, `cmove`, `cmovg`, `cmovge`, `cmovl`, `cmovle`, `cmovna`, `cmovnae`, `cmovnb`, `cmovnbe`, `cmovnc`, `cmovne`, `cmovng`, `cmovnge`, `cmovnl`, `cmovnle`, `cmovno`, `cmovnp`, `cmovns`, `cmovnz`, `cmovo`, `cmovp`, `cmovpe`, `cmovpo`, `cmovs`, `cmovz`)
+- `setcc` (all 16 condition codes: `seta`, `setae`, `setb`, `setbe`, `setc`, `sete`, `setg`, `setge`, `setl`, `setle`, `setna`, `setnae`, `setnb`, `setnbe`, `setnc`, `setne`, `setng`, `setnge`, `setnl`, `setnle`, `setno`, `setnp`, `setns`, `setnz`, `seto`, `setp`, `setpe`, `setpo`, `sets`, `setz`)
+- `bt`, `bts`, `btr`, `btc`, `bsf`, `bsr`
+- `bswap`
+- `xadd`, `cmpxchg`
 - `finit`, `fld`, `fld1`, `fldz`, `fild`
+- `fldpi`, `fldl2e`, `fldl2t`, `fldln2`, `fldlg2`
 - `fiadd`, `fisub`, `fisubr`, `fimul`, `fidiv`, `fidivr`
 - `fst`, `fstp`, `fstcw`, `fstsw`, `fldcw`, `fnstsw`, `fist`, `fistp`
 - `fadd`, `fsub`, `fsubr`, `fmul`, `fdiv`, `fdivr`
+- `faddp`, `fsubp`, `fsubrp`, `fmulp`, `fdivp`, `fdivrp`
 - `fabs`, `fchs`, `fsqrt`, `f2xm1`, `fyl2x`, `frndint`, `ftst`
-- `fcom`, `fcomi`, `fcomp`
-- `fclex`, `fwait`, `fincstp`
+- `fsin`, `fcos`, `fsincos`, `fptan`, `fpatan`
+- `fprem`, `fprem1`, `fscale`, `fxtract`
+- `fcom`, `fcomi`, `fcomp`, `fcomip`, `fcompp`
+- `fucom`, `fucomp`, `fucomi`, `fucomip`, `fucompp`
+- `fxch`
+- `fclex`, `fwait`, `fincstp`, `fdecstp`, `fnop`, `ffree`
+- `fstenv`, `fnstenv`, `fldenv`
 - `jmp`
 - `je`, `jz`, `jne`, `jnz`
 - `jl`, `jle`, `jg`, `jge`, `jng`, `jnl`, `jnge`, `jnle`
@@ -107,6 +120,7 @@ This project is now aimed at **real Irvine-style student console programs**, not
 - `IsDigit`
 - `WriteStackFrame`
 - `WriteStackFrameName`
+- `GetDateTime`
 
 #### Input
 
@@ -150,6 +164,7 @@ This project is now aimed at **real Irvine-style student console programs**, not
 - `HeapFree` via `INVOKE`
 - `HeapCreate` via `INVOKE`
 - `HeapDestroy` via `INVOKE`
+- `HeapSize` via `INVOKE`
 
 #### File I/O
 
@@ -175,6 +190,8 @@ This project is now aimed at **real Irvine-style student console programs**, not
 - `MessageBox` / `MessageBoxA` via `call` and `INVOKE`
 - `FormatMessage` / `FormatMessageA` via `call` and `INVOKE`
 - `LocalFree` via `call` and `INVOKE`
+- `GetCommandLineA` / `GetCommandLine` via `call` and `INVOKE`
+- `wsprintfA` / `wsprintf` via `call` and `INVOKE`
 
 #### Win32-style console and timing shims via `INVOKE`
 
@@ -217,6 +234,7 @@ This project is now aimed at **real Irvine-style student console programs**, not
 - `mDump`
 - `mDumpMem`
 - `mShow`
+- `mShowRegister`
 - `exit`
 - `Startup`
 - user-defined `MACRO` / `ENDM` with positional parameters, `:REQ`, `:=` defaults, nested expansion, `LOCAL` labels, and bare-name / `&param` / `&param&` substitution
@@ -231,7 +249,6 @@ This is **not** full ML.EXE/LINK.EXE compatibility yet.
 
 - Full MASM compile-time macro language (`IFB`, `IFIDNI`, `EXITM`, macro-time conditionals, advanced `TEXTEQU` metaprogramming, and similar directives beyond the currently implemented `REPT` / `REPEAT`, `WHILE`, `FOR`, and `FORC` subset)
 - Full Win32 API coverage
-- Full x87 instruction coverage, including the transcendental/environment-management instructions used by the more advanced floating-point support code
 - Exact 80-bit `REAL10` arithmetic fidelity; current support accepts/parses `REAL10` and treats it as a practical float-backed approximation for the book's load/store examples
 - Full MASM type system, records, anonymous field promotion, and the more advanced structure/union directives beyond the currently supported classroom subset
 - The broader typed pointer/cast surface used by the more advanced struct-heavy examples
@@ -260,7 +277,7 @@ This is **not** full ML.EXE/LINK.EXE compatibility yet.
 The release workflow:
 
 1. validates the requested semantic version
-2. cross-compiles `masm2wasm` for Linux, Windows, and macOS on `amd64` and `arm64`
+2. cross-compiles `masm2wasm` for Linux, Windows, and macOS on `amd64` and `arm64`, plus a standalone WASI WebAssembly build
 3. stamps the release version, commit, and build date into each binary
 4. creates a new GitHub release and uploads the binaries plus `SHA256SUMS.txt`
 

@@ -1084,6 +1084,18 @@ func (p *Parser) parseCodeLine(lineNo int, line string) error {
 		}
 		p.addInst(lineNo, line, "mshow", value, vm.Operand{Kind: "string", Text: format})
 		return nil
+	case "mshowregister":
+		parts := splitTopLevel(rest, ',')
+		if len(parts) != 2 {
+			return fmt.Errorf("line %d: mShowRegister expects regName, regValue", lineNo)
+		}
+		regName := strings.TrimSpace(parts[0])
+		regVal, err := p.parseOperand(lineNo, "mshowregister", strings.TrimSpace(parts[1]))
+		if err != nil {
+			return err
+		}
+		p.addInst(lineNo, line, "mshowregister", vm.Operand{Kind: "string", Text: regName}, regVal)
+		return nil
 	case "invoke":
 		return p.parseInvoke(lineNo, line, rest)
 	case "rep", "repe", "repz", "repne", "repnz":

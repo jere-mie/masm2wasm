@@ -405,6 +405,72 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 		return false, m.execFLDCW(inst)
 	case "fnstsw":
 		return false, m.execFNSTSW(inst)
+	case "fxch":
+		return false, m.execFXCH(inst)
+	case "faddp":
+		return false, m.execFArithmeticPop(inst, "add")
+	case "fsubp":
+		return false, m.execFArithmeticPop(inst, "sub")
+	case "fsubrp":
+		return false, m.execFReverseArithmeticPop(inst, "sub")
+	case "fmulp":
+		return false, m.execFArithmeticPop(inst, "mul")
+	case "fdivp":
+		return false, m.execFArithmeticPop(inst, "div")
+	case "fdivrp":
+		return false, m.execFReverseArithmeticPop(inst, "div")
+	case "fcomip":
+		return false, m.execFCOMIP(inst)
+	case "fucom":
+		return false, m.execFUCOM(inst)
+	case "fucomp":
+		return false, m.execFUCOMP(inst)
+	case "fucomi":
+		return false, m.execFUCOMI(inst)
+	case "fucomip":
+		return false, m.execFUCOMIP(inst)
+	case "fcompp":
+		return false, m.execFCOMPP()
+	case "fucompp":
+		return false, m.execFUCOMPP()
+	case "fldpi":
+		return false, m.fpuPush(math.Pi)
+	case "fldl2e":
+		return false, m.fpuPush(math.Log2E)
+	case "fldl2t":
+		return false, m.fpuPush(1.0 / math.Log10(2))
+	case "fldln2":
+		return false, m.fpuPush(math.Ln2)
+	case "fldlg2":
+		return false, m.fpuPush(math.Log10(2))
+	case "fsin":
+		return false, m.execFUnary("sin")
+	case "fcos":
+		return false, m.execFUnary("cos")
+	case "fsincos":
+		return false, m.execFSINCOS()
+	case "fptan":
+		return false, m.execFPTAN()
+	case "fpatan":
+		return false, m.execFPATAN()
+	case "fprem":
+		return false, m.execFPREM(false)
+	case "fprem1":
+		return false, m.execFPREM(true)
+	case "fscale":
+		return false, m.execFSCALE()
+	case "fxtract":
+		return false, m.execFXTRACT()
+	case "fnop":
+		return false, nil
+	case "ffree":
+		return false, m.execFFREE(inst)
+	case "fdecstp":
+		return false, m.execFDECSTP()
+	case "fstenv", "fnstenv":
+		return false, m.execFSTENV(inst)
+	case "fldenv":
+		return false, m.execFLDENV(inst)
 	case "sahf":
 		return false, m.execSAHF()
 	case "cld":
@@ -622,13 +688,13 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 		return m.jumpIf(current, inst, !m.of)
 	case "jcxz", "jecxz":
 		return m.jumpIf(current, inst, m.regs[regECX] == 0)
-	case "loop":
+	case "loop", "loopd":
 		m.regs[regECX]--
 		return m.jumpIf(current, inst, m.regs[regECX] != 0)
-	case "loopz", "loope":
+	case "loopz", "loope", "loopzd", "looped":
 		m.regs[regECX]--
 		return m.jumpIf(current, inst, m.regs[regECX] != 0 && m.zf)
-	case "loopnz", "loopne":
+	case "loopnz", "loopne", "loopnzd", "loopned":
 		m.regs[regECX]--
 		return m.jumpIf(current, inst, m.regs[regECX] != 0 && !m.zf)
 	case "call":
@@ -651,6 +717,8 @@ func (m *Machine) execute(frames *[]frame, current *frame, inst Instruction) (bo
 		return false, m.execMacroDump(inst)
 	case "mshow":
 		return false, m.execMacroShow(inst)
+	case "mshowregister":
+		return false, m.execMacroShowRegister(inst)
 	default:
 		return false, fmt.Errorf("unsupported instruction %q", inst.Op)
 	}
@@ -1701,6 +1769,10 @@ func (m *Machine) execFUnary(op string) error {
 		value = math.Abs(value)
 	case "sqrt":
 		value = math.Sqrt(value)
+	case "sin":
+		value = math.Sin(value)
+	case "cos":
+		value = math.Cos(value)
 	default:
 		return fmt.Errorf("unsupported floating-point unary op %q", op)
 	}
@@ -2623,6 +2695,18 @@ func (m *Machine) dispatchCallBuiltin(name string) func() error {
 		return m.builtinFormatMessage
 	case "localfree":
 		return m.builtinLocalFree
+	case "getdatetime":
+		return m.builtinGetDateTime
+	case "writestackframe":
+		return m.builtinWriteStackFrame
+	case "writestackframename":
+		return m.builtinWriteStackFrameName
+	case "getcommandlinea", "getcommandline":
+		return m.builtinGetCommandLineA
+	case "wsprintfa", "wsprintf":
+		return m.builtinWsprintf
+	case "heapsize":
+		return m.builtinHeapSize
 	default:
 		return nil
 	}
@@ -6178,6 +6262,8 @@ func clampWidth(width int) int {
 	switch width {
 	case 1, 2, 4:
 		return width
+	case 8:
+		return 4
 	default:
 		return 0
 	}
